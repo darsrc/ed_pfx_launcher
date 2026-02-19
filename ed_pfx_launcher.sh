@@ -2,1220 +2,345 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-# ============================================================
-# ed_pfx_launcher.sh
-# Feature-complete, Steam-safe Elite Dangerous + EDCoPilot launcher
-#
-# Key design:
-# - Steam entrypoint spawns a detached watcher, then execs into the game
-#   so Steam sees the correct running PID (prevents STOP hang).
-# - Watcher orchestrates EDCoPilot/tools + shutdown.
-# - Configurable via ed_pfx_launcher.ini.
-# ============================================================
-
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# ----------------------------
-# Logging
-# ----------------------------
 STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
-DEFAULT_LOG_DIR="$STATE_HOME/ed_pfx_launcher/logs"
-mkdir -p "$DEFAULT_LOG_DIR"
-
-MAIN_LOG="$DEFAULT_LOG_DIR/main.log"
-WATCHER_LOG="$DEFAULT_LOG_DIR/watcher.log"
+LOG_DIR="$STATE_HOME/ed_pfx_launcher/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/coordinator.log"
+: > "$LOG_FILE" || true
 
 _ts() { date +'%H:%M:%S'; }
-log()  { echo "[$(_ts)] $*" | tee -a "$MAIN_LOG" >/dev/null; }
-warn() { echo "[$(_ts)] WARN: $*" | tee -a "$MAIN_LOG" >&2 >/dev/null; }
-die()  { echo "[$(_ts)] ERROR: $*" | tee -a "$MAIN_LOG" >&2 >/dev/null; exit 1; }
+log() { echo "[$(_ts)] $*" | tee -a "$LOG_FILE" >/dev/null; }
+warn() { echo "[$(_ts)] WARN: $*" | tee -a "$LOG_FILE" >/dev/null; }
+die() { echo "[$(_ts)] ERROR: $*" | tee -a "$LOG_FILE" >/dev/null; exit 1; }
 
-# Watcher logging (separate file)
-wlog()  { echo "[$(_ts)] $*" | tee -a "$WATCHER_LOG" >/dev/null; }
-wwarn() { echo "[$(_ts)] WARN: $*" | tee -a "$WATCHER_LOG" >&2 >/dev/null; }
+phase_start() { log "[PHASE:$1] START"; }
+phase_end() { log "[PHASE:$1] END"; }
+phase_fail() { log "[PHASE:$1] FAIL: $2"; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# ----------------------------
-# Defaults / CLI state
-# ----------------------------
 CONFIG_PATH="$SCRIPT_DIR/ed_pfx_launcher.ini"
 NO_GAME=0
 WAIT_TOOLS=0
-VERBOSE=1
 DRY_RUN=0
-WATCHER_MODE=0
-
-# When invoked by watcher, we pass a couple explicit args
-WATCHER_GAME_PID=""
-WATCHER_LAUNCH_MODE=""
-
-# CLI tool list (in addition to INI tools)
 declare -a CLI_TOOLS=()
+declare -a FORWARDED_CMD=()
 
 usage() {
-  cat <<EOF
+  cat <<USAGE
 Usage:
   $SCRIPT_NAME [--config <ini>] [--no-game] [--wait-tools] [--tool <exe>]... [--dry-run] [--] %command%
-
-Steam Launch Options (single line):
-  "/ABS/PATH/$SCRIPT_NAME" --config "/ABS/PATH/ed_pfx_launcher.ini" -- %command%
-
-Options:
-  --config <path>      Path to ed_pfx_launcher.ini (default: $CONFIG_PATH)
-  --tool <exe>         Add a tool exe path (repeatable)
-  --no-game            Tools-only mode
-  --wait-tools         With --no-game: keep script attached until tools exit
-  --dry-run            Print decisions, don't launch
-  --watcher            Internal: watcher mode (do not call directly)
-  -h, --help
-EOF
+USAGE
 }
 
-# Parse args
-FORWARDED_CMD=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) CONFIG_PATH="${2:-}"; shift 2;;
-    --tool) CLI_TOOLS+=( "${2:-}" ); shift 2;;
+    --tool) CLI_TOOLS+=("${2:-}"); shift 2;;
     --no-game) NO_GAME=1; shift;;
     --wait-tools) WAIT_TOOLS=1; shift;;
     --dry-run) DRY_RUN=1; shift;;
-    --watcher)
-      WATCHER_MODE=1
-      WATCHER_GAME_PID="${2:-}"; shift 2
-      WATCHER_LAUNCH_MODE="${2:-}"; shift 2
-      ;;
     -h|--help) usage; exit 0;;
-    --) shift; FORWARDED_CMD=( "$@" ); break;;
-    *)
-      # If user forgets -- and this is %command% expansion, it'll look like a path.
-      # We accept it as forwarded cmd if it looks executable-ish.
-      FORWARDED_CMD+=( "$1" ); shift;;
+    --) shift; FORWARDED_CMD=("$@"); break;;
+    *) FORWARDED_CMD+=("$1"); shift;;
   esac
 done
 
-# Ensure log files exist
-: > "$MAIN_LOG" || true
-: > "$WATCHER_LOG" || true
-
-log "Starting: $SCRIPT_NAME"
-log "CONFIG=$CONFIG_PATH"
-
-# ----------------------------
 # INI parsing
-# ----------------------------
-# We store keys as CFG["section.key"]
 declare -A CFG=()
-
-_trim() {
-  local s="$1"
-  # remove leading/trailing whitespace
-  s="${s#"${s%%[![:space:]]*}"}"
-  s="${s%"${s##*[![:space:]]}"}"
-  printf '%s' "$s"
-}
-
-_strip_inline_comment() {
-  local s="$1"
-  local out=""
-  local in_sq=0
-  local in_dq=0
-  local i ch prev
-  for ((i=0; i<${#s}; i++)); do
-    ch="${s:i:1}"
-    prev=""
-    if (( i > 0 )); then prev="${s:i-1:1}"; fi
-
-    if [[ "$ch" == "'" && $in_dq -eq 0 ]]; then
-      in_sq=$((1-in_sq))
-    elif [[ "$ch" == '"' && $in_sq -eq 0 ]]; then
-      in_dq=$((1-in_dq))
-    fi
-
-    if (( in_sq == 0 && in_dq == 0 )); then
-      if [[ ( "$ch" == ";" || "$ch" == "#" ) && ( $i -eq 0 || "$prev" =~ [[:space:]] ) ]]; then
-        break
-      fi
-    fi
-    out+="$ch"
-  done
-  printf '%s' "$out"
-}
-
-_unquote() {
-  local s="$1"
-  if [[ "$s" =~ ^".*"$ ]]; then
-    s="${s:1:${#s}-2}"
-  elif [[ "$s" =~ ^'.*'$ ]]; then
-    s="${s:1:${#s}-2}"
-  fi
-  printf '%s' "$s"
-}
+_trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+_unquote() { local s="$1"; [[ "$s" =~ ^".*"$ ]] && s="${s:1:${#s}-2}"; [[ "$s" =~ ^'.*'$ ]] && s="${s:1:${#s}-2}"; printf '%s' "$s"; }
 
 ini_load() {
-  local file="$1"
+  local file="$1" section="" raw line key val
   [[ -f "$file" ]] || die "Config not found: $file"
-
-  local section=""
-  local line raw key val
-
   while IFS= read -r raw || [[ -n "$raw" ]]; do
     line="$(_trim "$raw")"
-    [[ -z "$line" ]] && continue
-    [[ "$line" == \;* || "$line" == \#* ]] && continue
-
+    [[ -z "$line" || "$line" == \#* || "$line" == \;* ]] && continue
     if [[ "$line" =~ ^\[[^\]]+\]$ ]]; then
       section="${line:1:${#line}-2}"
       section="${section,,}"
       continue
     fi
-
     if [[ "$line" == *"="* ]]; then
-      key="${line%%=*}"
-      val="${line#*=}"
-      key="$(_trim "$key")"
-      val="$(_trim "$val")"
-      val="$(_strip_inline_comment "$val")"
-      val="$(_trim "$val")"
-      val="$(_unquote "$val")"
+      key="$(_trim "${line%%=*}")"
+      val="$(_trim "${line#*=}")"
       key="${key,,}"
-      if [[ -n "$section" && -n "$key" ]]; then
-        CFG["$section.$key"]="$val"
-      fi
+      val="$(_unquote "$val")"
+      [[ -n "$section" && -n "$key" ]] && CFG["$section.$key"]="$val"
     fi
   done < "$file"
 }
 
-cfg_get() {
-  local k="$1"
-  local def="${2:-}"
-  local v="${CFG[$k]:-$def}"
-  printf '%s' "$v"
-}
-
+cfg_get() { printf '%s' "${CFG[$1]:-${2:-}}"; }
 cfg_bool() {
-  local key="$1"
-  local raw def
-  raw="$(cfg_get "$key" "")"
-  def="${2:-false}"
-  raw="${raw,,}"
-
-  case "$raw" in
-    true|false)
-      printf '%s' "$raw"
-      ;;
-    "")
-      printf '%s' "$def"
-      ;;
-    *)
-      warn "Invalid boolean for $key='$raw'; using default '$def'"
-      printf '%s' "$def"
-      ;;
-  esac
+  local v="$(cfg_get "$1" "${2:-false}")"
+  case "${v,,}" in true|false) printf '%s' "${v,,}" ;; *) printf '%s' "${2:-false}" ;; esac
 }
-
 cfg_int() {
-  local key="$1"
-  local def="$2"
-  local min="$3"
-  local raw
-  raw="$(cfg_get "$key" "$def")"
-
-  if [[ ! "$raw" =~ ^[0-9]+$ ]]; then
-    warn "Invalid integer for $key='$raw'; using default '$def'"
-    printf '%s' "$def"
-    return 0
-  fi
-
-  if (( raw < min )); then
-    warn "Out-of-range value for $key='$raw' (min=$min); using default '$def'"
-    printf '%s' "$def"
-    return 0
-  fi
-
-  printf '%s' "$raw"
+  local raw="$(cfg_get "$1" "$2")"
+  [[ "$raw" =~ ^[0-9]+$ ]] && (( raw >= $3 )) && { printf '%s' "$raw"; return; }
+  printf '%s' "$2"
 }
 
-# Expand {tokens} in values
 expand_tokens() {
   local s="$1"
-  local home="$HOME"
-  local appid="$2"
-  local steam_root="$3"
-  local compatdata="$4"
-  local prefix="$5"
-
-  s="${s//\{home\}/$home}"
-  s="${s//\{appid\}/$appid}"
-  s="${s//\{steam_root\}/$steam_root}"
-  s="${s//\{compatdata\}/$compatdata}"
-  s="${s//\{prefix\}/$prefix}"
+  s="${s//\{home\}/$HOME}"
+  s="${s//\{appid\}/$APPID}"
+  s="${s//\{steam_root\}/$STEAM_ROOT}"
+  s="${s//\{compatdata\}/$COMPATDATA_DIR}"
+  s="${s//\{prefix\}/$WINEPREFIX}"
   printf '%s' "$s"
 }
 
-# ----------------------------
-# Detection helpers
-# ----------------------------
 detect_steam_root() {
-  local c
-  c="${STEAM_COMPAT_CLIENT_INSTALL_PATH:-}"
-  if [[ -n "$c" && -d "$c" ]]; then printf '%s' "$c"; return 0; fi
-
-  if [[ -d "$HOME/.local/share/Steam" ]]; then printf '%s' "$HOME/.local/share/Steam"; return 0; fi
-  if [[ -d "$HOME/.steam/debian-installation" ]]; then printf '%s' "$HOME/.steam/debian-installation"; return 0; fi
-
-  if [[ -e "$HOME/.steam/root" ]]; then
-    c="$(readlink -f "$HOME/.steam/root" 2>/dev/null || true)"
-    [[ -n "$c" && -d "$c" ]] && { printf '%s' "$c"; return 0; }
-  fi
-
-  if [[ -d "$HOME/.steam/steam" ]]; then printf '%s' "$HOME/.steam/steam"; return 0; fi
-
+  local c="${STEAM_COMPAT_CLIENT_INSTALL_PATH:-}"
+  [[ -n "$c" && -d "$c" ]] && { printf '%s' "$c"; return 0; }
+  for c in "$HOME/.local/share/Steam" "$HOME/.steam/debian-installation" "$HOME/.steam/steam"; do
+    [[ -d "$c" ]] && { printf '%s' "$c"; return 0; }
+  done
   return 1
 }
 
 detect_runtime_client() {
-  local steam_root="$1"
-  local p
-  # common location
+  local steam_root="$1" p
   p="$steam_root/steamapps/common/SteamLinuxRuntime_sniper/pressure-vessel/bin/steam-runtime-launch-client"
   [[ -x "$p" ]] && { printf '%s' "$p"; return 0; }
-
-  # other runtimes (soldier/sniper variations)
   for p in "$steam_root"/steamapps/common/SteamLinuxRuntime_*/pressure-vessel/bin/steam-runtime-launch-client; do
     [[ -x "$p" ]] && { printf '%s' "$p"; return 0; }
   done
   return 1
 }
 
-bus_available() {
-  local bus="$1"
-  have busctl || return 1
-  busctl --user list 2>/dev/null | awk '{print $1}' | grep -qx "$bus"
-}
-
-wait_for_bus() {
-  local bus="$1" timeout="$2"
-  local i=0
-  while (( i < timeout )); do
-    bus_available "$bus" && return 0
-    sleep 1
-    i=$((i+1))
-  done
-  return 1
-}
-
-# Find libraryfolders.vdf paths containing appid
-vdf_library_paths_for_appid() {
-  local vdf="$1" appid="$2"
-  [[ -f "$vdf" ]] || return 0
-
-  awk -v appid="$appid" '
-    /"path"/ {
-      p=$2; gsub(/"/,"",p)
-      current_path=p
-    }
-    /"apps"/ { in_apps=1 }
-    in_apps && $1 ~ "\""appid"\"" {
-      print current_path
-    }
-    /}/ && in_apps { in_apps=0 }
-  ' "$vdf" | sort -u
-}
-
-find_installdir_from_manifest() {
-  local manifest="$1"
-  [[ -f "$manifest" ]] || return 1
-
-  awk -F'"' '/"installdir"/ { print $4; exit }' "$manifest"
-}
-
-# Try to locate Elite install dir and MinEdLauncher.exe
-find_mined_exe() {
-  local appid="$1" steam_root="$2" library_vdf="$3"
-
-  local -a candidate_roots=()
-  candidate_roots+=("$steam_root")
-
-  local lp
-  while IFS= read -r lp; do
-    [[ -n "$lp" ]] && candidate_roots+=("$lp")
-  done < <(vdf_library_paths_for_appid "$library_vdf" "$appid")
-
-  local root manifest installdir
-  for root in "${candidate_roots[@]}"; do
-    manifest="$root/steamapps/appmanifest_${appid}.acf"
-    installdir="$(find_installdir_from_manifest "$manifest" || true)"
-    if [[ -n "$installdir" && -f "$root/steamapps/common/$installdir/MinEdLauncher.exe" ]]; then
-      printf '%s' "$root/steamapps/common/$installdir/MinEdLauncher.exe"; return 0
-    fi
-  done
-
-  # Most common
-  if [[ -f "$steam_root/steamapps/common/Elite Dangerous/MinEdLauncher.exe" ]]; then
-    printf '%s' "$steam_root/steamapps/common/Elite Dangerous/MinEdLauncher.exe"; return 0
-  fi
-
-  # Check libraries
-  while IFS= read -r lp; do
-    [[ -z "$lp" ]] && continue
-    if [[ -f "$lp/steamapps/common/Elite Dangerous/MinEdLauncher.exe" ]]; then
-      printf '%s' "$lp/steamapps/common/Elite Dangerous/MinEdLauncher.exe"; return 0
-    fi
-  done < <(vdf_library_paths_for_appid "$library_vdf" "$appid")
-
-  return 1
-}
-
-resolve_edcopilot_exe() {
-  local explicit_abs="$1"
-  local explicit_rel="$2"
-
-  if [[ -n "$explicit_abs" ]]; then
-    expand_tokens "$explicit_abs" "$APPID" "$STEAM_ROOT" "$COMPATDATA_DIR" "$WINEPREFIX"
-    return 0
-  fi
-
-  if [[ -n "$explicit_rel" ]]; then
-    local rel_candidate="$WINEPREFIX/$explicit_rel"
-    if [[ -f "$rel_candidate" ]]; then
-      printf '%s' "$rel_candidate"
-      return 0
-    fi
-  fi
-
-  local -a candidates=(
-    "$WINEPREFIX/drive_c/EDCoPilot/LaunchEDCoPilot.exe"
-    "$WINEPREFIX/drive_c/Program Files/EDCoPilot/LaunchEDCoPilot.exe"
-    "$WINEPREFIX/drive_c/Program Files (x86)/EDCoPilot/LaunchEDCoPilot.exe"
-  )
-
-  local c
-  for c in "${candidates[@]}"; do
-    if [[ -f "$c" ]]; then
-      printf '%s' "$c"
-      return 0
-    fi
-  done
-
-  # Return the configured relative path even if missing so logs remain explicit.
-  if [[ -n "$explicit_rel" ]]; then
-    printf '%s' "$WINEPREFIX/$explicit_rel"
-  else
-    printf '%s' "$WINEPREFIX/drive_c/EDCoPilot/LaunchEDCoPilot.exe"
-  fi
-}
-
-# Find Proton path from compatdata/config_info if possible
-find_proton_from_config_info() {
-  local compatdata="$1"
-  local cfg="$compatdata/config_info"
-  [[ -f "$cfg" ]] || return 1
-
-  local line
-  line="$(grep -m1 -E '/(common|compatibilitytools\.d)/[^[:space:]"]+/proton' "$cfg" 2>/dev/null || true)"
-  if [[ -n "$line" ]]; then
-    # extract path containing .../proton
-    local p
-    p="$(echo "$line" | grep -oE '/(common|compatibilitytools\.d)/[^[:space:]"]+/proton' | head -n1)"
-    [[ -n "$p" && -x "$p" ]] && { printf '%s' "$p"; return 0; }
-  fi
-
-  return 1
-}
-
-# Find Proton path by searching common locations
-find_proton_fallback() {
-  local steam_root="$1"
-
-  # Prefer GE-Proton if present
-  local d
-  for d in "$HOME/.steam/steam/compatibilitytools.d" "$steam_root/compatibilitytools.d" "$steam_root/steamapps/compatibilitytools.d"; do
-    if [[ -d "$d" ]]; then
-      local p
-      p="$(ls -1d "$d"/*/proton 2>/dev/null | head -n1 || true)"
-      [[ -n "$p" && -x "$p" ]] && { printf '%s' "$p"; return 0; }
-    fi
-  done
-
-  # Steam shipped Proton
-  local p
-  p="$(ls -1d "$steam_root"/steamapps/common/Proton*/*/proton 2>/dev/null | head -n1 || true)"
-  [[ -n "$p" && -x "$p" ]] && { printf '%s' "$p"; return 0; }
-
+find_proton() {
+  local steam_root="$1" p
   p="$(ls -1d "$steam_root"/steamapps/common/Proton*/proton 2>/dev/null | head -n1 || true)"
   [[ -n "$p" && -x "$p" ]] && { printf '%s' "$p"; return 0; }
-
-  return 1
-}
-
-# Detect game running
-is_elite_running() {
-  pgrep -f 'EliteDangerous64\.exe' >/dev/null 2>&1 && return 0
-  pgrep -f 'EDLaunch\.exe' >/dev/null 2>&1 && return 0
-  return 1
-}
-
-# Find a PID to monitor (launcher or game)
-detect_elite_pid() {
-  local pid
-  pid="$(pgrep -f 'EliteDangerous64\.exe' | head -n1 || true)"
-  [[ -n "$pid" ]] && { printf '%s' "$pid"; return 0; }
-  pid="$(pgrep -f 'EDLaunch\.exe' | head -n1 || true)"
-  [[ -n "$pid" ]] && { printf '%s' "$pid"; return 0; }
-  printf '%s' ""
-}
-
-# ----------------------------
-# Load INI
-# ----------------------------
-ini_load "$CONFIG_PATH"
-
-# ----------------------------
-# Resolve core paths
-# ----------------------------
-APPID="$(cfg_get 'steam.appid' "${SteamGameId:-${SteamAppId:-359320}}")"
-[[ "$APPID" =~ ^[0-9]+$ ]] || die "steam.appid must be numeric (got: $APPID)"
-BUS_NAME="com.steampowered.App$APPID"
-
-STEAM_ROOT="$(cfg_get 'steam.steam_root' "")"
-if [[ -z "$STEAM_ROOT" ]]; then
-  STEAM_ROOT="$(detect_steam_root || true)"
-fi
-[[ -n "$STEAM_ROOT" && -d "$STEAM_ROOT" ]] || die "Could not detect Steam root. Set [steam] steam_root in INI."
-
-COMPATDATA_DIR="$(cfg_get 'steam.compatdata_dir' "${STEAM_COMPAT_DATA_PATH:-}")"
-if [[ -z "$COMPATDATA_DIR" ]]; then
-  COMPATDATA_DIR="$STEAM_ROOT/steamapps/compatdata/$APPID"
-fi
-[[ -d "$COMPATDATA_DIR" ]] || die "Compatdata not found: $COMPATDATA_DIR (set [steam] compatdata_dir)"
-
-WINEPREFIX="$COMPATDATA_DIR/pfx"
-[[ -d "$WINEPREFIX" ]] || die "WINEPREFIX not found: $WINEPREFIX"
-
-LIBVDF="$(cfg_get 'steam.libraryfolders_vdf' "")"
-[[ -z "$LIBVDF" ]] && LIBVDF="$STEAM_ROOT/config/libraryfolders.vdf"
-
-RUNTIME_CLIENT="$(cfg_get 'steam.runtime_client' "")"
-if [[ -z "$RUNTIME_CLIENT" ]]; then
-  RUNTIME_CLIENT="$(detect_runtime_client "$STEAM_ROOT" || true)"
-fi
-
-PROTON_BIN="$(cfg_get 'proton.proton' "")"
-if [[ -z "$PROTON_BIN" ]]; then
-  PROTON_BIN="$(find_proton_from_config_info "$COMPATDATA_DIR" || true)"
-fi
-if [[ -z "$PROTON_BIN" ]]; then
-  PROTON_BIN="$(find_proton_fallback "$STEAM_ROOT" || true)"
-fi
-[[ -n "$PROTON_BIN" && -x "$PROTON_BIN" ]] || die "Could not find Proton 'proton' binary. Set [proton] proton in INI."
-
-PROTON_DIR="$(dirname "$PROTON_BIN")"
-WINELOADER="$PROTON_DIR/files/bin/wine"
-WINESERVER="$PROTON_DIR/files/bin/wineserver"
-[[ -x "$WINELOADER" ]] || die "WINELOADER not executable: $WINELOADER"
-[[ -x "$WINESERVER" ]] || warn "WINESERVER not executable: $WINESERVER (cleanup may be reduced)"
-
-# ----------------------------
-# Perf + environment
-# ----------------------------
-DXVK_FILTER_DEVICE_NAME="$(cfg_get 'perf.dxvk_filter_device_name' "${DXVK_FILTER_DEVICE_NAME:-}")"
-DXVK_FRAME_RATE="$(cfg_get 'perf.dxvk_frame_rate' "${DXVK_FRAME_RATE:-}")"
-PULSE_LATENCY_MSEC="$(cfg_get 'perf.pulse_latency_msec' "${PULSE_LATENCY_MSEC:-90}")"
-PROTON_ENABLE_WAYLAND="$(cfg_get 'perf.proton_enable_wayland' "${PROTON_ENABLE_WAYLAND:-}")"
-
-# Unset laptop/offload vars
-unset __NV_PRIME_RENDER_OFFLOAD
-unset __GLX_VENDOR_LIBRARY_NAME
-unset __VK_LAYER_NV_optimus
-
-[[ -n "$DXVK_FILTER_DEVICE_NAME" ]] && export DXVK_FILTER_DEVICE_NAME="$DXVK_FILTER_DEVICE_NAME"
-[[ -n "$DXVK_FRAME_RATE" ]] && export DXVK_FRAME_RATE="$DXVK_FRAME_RATE"
-export PULSE_LATENCY_MSEC="$PULSE_LATENCY_MSEC"
-
-# Wayland hint (if already in Wayland session)
-if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
-  [[ -n "$PROTON_ENABLE_WAYLAND" ]] && export PROTON_ENABLE_WAYLAND="$PROTON_ENABLE_WAYLAND"
-fi
-
-# Steam/Proton env that helps tools launched outside Steam context
-export WINEPREFIX="$WINEPREFIX"
-export STEAM_COMPAT_DATA_PATH="$COMPATDATA_DIR"
-export STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT"
-export SteamGameId="$APPID"
-
-WINDEBUG="$(cfg_get 'debug.winedebug' 'false')"
-if [[ "$WINDEBUG" == "true" ]]; then
-  export WINEDEBUG="+fixme,+err,+loaddll,+warn"
-else
-  export WINEDEBUG="-all"
-fi
-
-# ----------------------------
-# Elite config
-# ----------------------------
-ELITE_LAUNCH_MODE="$(cfg_get 'elite.launch_mode' 'auto')"   # auto|steam|mined
-TERMINAL_MODE="$(cfg_get 'elite.terminal_mode' 'auto')"     # auto|mined|steam_applaunch|command
-ELITE_PROFILE="$(cfg_get 'elite.profile' 'default')"
-ELITE_MINED_FLAGS="$(cfg_get 'elite.mined_flags' '/autorun /autoquit /edo')"
-ELITE_MONITOR_GAME="$(cfg_bool 'elite.monitor_game' 'true')"
-HOTAS_FIX_ENABLED="$(cfg_bool 'elite.hotas_fix_enabled' 'false')"
-
-# ----------------------------
-# EDCoPilot config
-# ----------------------------
-EDCOPILOT_ENABLED="$(cfg_bool 'edcopilot.enabled' 'true')"
-EDCOPILOT_MODE="$(cfg_get 'edcopilot.mode' 'auto')"         # auto|runtime|wine
-EDCOPILOT_DELAY="$(cfg_int 'edcopilot.delay' '30' '0')"
-EDCOPILOT_BUS_WAIT="$(cfg_int 'edcopilot.bus_wait' '30' '0')"
-EDCOPILOT_INIT_TIMEOUT="$(cfg_int 'edcopilot.init_timeout' '45' '1')"
-EDCOPILOT_RETRIES="$(cfg_int 'edcopilot.retries' '3' '1')"
-EDCOPILOT_RETRY_SLEEP="$(cfg_int 'edcopilot.retry_sleep' '3' '0')"
-EDCOPILOT_FORCE_LINUX_FLAG="$(cfg_bool 'edcopilot.force_linux_flag' 'true')"
-EDCOPILOT_STANDALONE="$(cfg_bool 'edcopilot.standalone' 'true')"
-EDCOPILOT_EXE_ABS="$(cfg_get 'edcopilot.exe' '')"
-EDCOPILOT_EXE_REL="$(cfg_get 'edcopilot.exe_rel' 'drive_c/EDCoPilot/LaunchEDCoPilot.exe')"
-
-# EDCoPTER config (optional)
-EDCOPTER_ENABLED="$(cfg_bool 'edcopter.enabled' 'false')"
-EDCOPTER_MODE="$(cfg_get 'edcopter.mode' 'auto')"
-EDCOPTER_EXE_ABS="$(cfg_get 'edcopter.exe' '')"
-EDCOPTER_EXE_REL="$(cfg_get 'edcopter.exe_rel' '')"
-EDCOPTER_HEADLESS="$(cfg_bool 'edcopter.headless' 'false')"
-EDCOPTER_LISTEN_IP="$(cfg_get 'edcopter.listen_ip' '')"
-EDCOPTER_LISTEN_PORT="$(cfg_get 'edcopter.listen_port' '')"
-EDCOPTER_EDCOPILOT_IP="$(cfg_get 'edcopter.edcopilot_ip' '')"
-EDCOPTER_ARGS_EXTRA="$(cfg_get 'edcopter.args_extra' '')"
-
-# Expand tokens for exe paths
-EDCOPILOT_EXE="$(resolve_edcopilot_exe "$EDCOPILOT_EXE_ABS" "$EDCOPILOT_EXE_REL")"
-
-EDCOPTER_EXE=""
-if [[ -n "$EDCOPTER_EXE_ABS" ]]; then
-  EDCOPTER_EXE="$(expand_tokens "$EDCOPTER_EXE_ABS" "$APPID" "$STEAM_ROOT" "$COMPATDATA_DIR" "$WINEPREFIX")"
-elif [[ -n "$EDCOPTER_EXE_REL" ]]; then
-  EDCOPTER_EXE="$WINEPREFIX/$EDCOPTER_EXE_REL"
-fi
-
-# ----------------------------
-# Tool sections: [tool.<name>]
-# ----------------------------
-# We discover any CFG keys beginning with "tool." and group them.
-declare -A TOOL_NAMES=()
-for k in "${!CFG[@]}"; do
-  if [[ "$k" == tool.*.* ]]; then
-    # tool.<name>.<key>
-    local_part="${k#tool.}"
-    name="${local_part%%.*}"
-    TOOL_NAMES["$name"]=1
-  fi
-done
-
-# ----------------------------
-# Validation / summary
-# ----------------------------
-log "Config summary:"
-log "  CONFIG=$CONFIG_PATH"
-log "  APPID=$APPID"
-log "  BUS_NAME=$BUS_NAME"
-log "  STEAM_ROOT=$STEAM_ROOT"
-log "  COMPATDATA_DIR=$COMPATDATA_DIR"
-log "  WINEPREFIX=$WINEPREFIX"
-log "  PROTON=$PROTON_BIN"
-log "  WINELOADER=$WINELOADER"
-log "  runtime_client=${RUNTIME_CLIENT:-<none>}"
-log "  EDCOPILOT exe=$EDCOPILOT_EXE"
-log "  EDCOPILOT mode=$EDCOPILOT_MODE delay=$EDCOPILOT_DELAY bus_wait=$EDCOPILOT_BUS_WAIT init_timeout=$EDCOPILOT_INIT_TIMEOUT retries=$EDCOPILOT_RETRIES"
-log "  NO_GAME=$NO_GAME WAIT_TOOLS=$WAIT_TOOLS"
-log "  LOG_DIR=$DEFAULT_LOG_DIR"
-
-# CLI tools validation
-for t in "${CLI_TOOLS[@]}"; do
-  [[ -f "$t" ]] || die "CLI tool not found: $t"
-done
-
-# ----------------------------
-# HOTAS fix helper
-# ----------------------------
-apply_hotas_fix() {
-  # Implements the same concept you had: override windows.gaming.input to avoid HOTAS crash.
-  # This is optional and only applied if enabled.
-  local enabled="$1"
-
-  if [[ "$enabled" != "true" ]]; then
-    return 0
-  fi
-
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    wlog "DRY-RUN: would apply HOTAS fix (windows.gaming.input override)"
-    return 0
-  fi
-
-  wlog "Applying HOTAS fix: setting windows.gaming.input DLL override"
-  "$WINELOADER" reg add "HKEY_CURRENT_USER\\Software\\Wine\\DllOverrides" /v "windows.gaming.input" /t REG_SZ /d "" /f >/dev/null 2>&1 || true
-}
-
-# ----------------------------
-# EDCoPilot INI patch (RunningOnLinux)
-# ----------------------------
-patch_edcopilot_linux_flag() {
-  local enabled="$1"
-  local exe="$2"
-
-  [[ "$enabled" == "true" ]] || return 0
-
-  local dir
-  dir="$(dirname "$exe")"
-  local f1="$dir/EDCoPilot.ini"
-  local f2="$dir/edcopilotgui.ini"
-
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    wlog "DRY-RUN: would patch RunningOnLinux in: $f1 and $f2"
-    return 0
-  fi
-
-  # Only patch if files exist
-  if [[ -f "$f1" ]]; then
-    # Preserve CRLF possibility by appending \r when replacing
-    sed -i $'s/RunningOnLinux="0"/RunningOnLinux="1"\r/g' "$f1" || true
-  fi
-  if [[ -f "$f2" ]]; then
-    sed -i $'s/RunningOnLinux="0"/RunningOnLinux="1"\r/g' "$f2" || true
-  fi
-}
-
-# ----------------------------
-# Tool launching helpers (watcher)
-# ----------------------------
-# We launch tools in separate process groups, so we can stop them cleanly.
-declare -a TOOL_PGIDS=()
-
-start_tool_wine_detached() {
-  local exe="$1"
-  local label="$2"
-  local log_file="$DEFAULT_LOG_DIR/${label}.wine.log"
-  local cwd
-  cwd="$(dirname "$exe")"
-
-  wlog "Launching (wine): $label"
-  wlog "  exe: $exe"
-  wlog "  cwd: $cwd"
-  wlog "  log: $log_file"
-
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    return 0
-  fi
-
-  # setsid makes it independent from Steam/terminal session
-  if have setsid; then
-    setsid bash -lc "cd \"$cwd\" && exec \"$PROTON_BIN\" run \"$exe\"" >>"$log_file" 2>&1 < /dev/null &
-    local pid=$!
-    TOOL_PGIDS+=("$pid")
-  else
-    ( cd "$cwd" && "$PROTON_BIN" run "$exe" >>"$log_file" 2>&1 < /dev/null ) &
-    TOOL_PGIDS+=("$!")
-  fi
-}
-
-start_tool_runtime_detached() {
-  local exe="$1"
-  local label="$2"
-  local log_file="$DEFAULT_LOG_DIR/${label}.runtime.log"
-  local cwd
-  cwd="$(dirname "$exe")"
-
-  if [[ -z "${RUNTIME_CLIENT:-}" || ! -x "${RUNTIME_CLIENT:-}" ]]; then
-    wwarn "Runtime client missing; cannot runtime-launch $label"
-    return 1
-  fi
-
-  wlog "Launching (runtime): $label"
-  wlog "  bus: $BUS_NAME"
-  wlog "  runtime: $RUNTIME_CLIENT"
-  wlog "  wine: $WINELOADER"
-  wlog "  exe: $exe"
-  wlog "  log: $log_file"
-
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    return 0
-  fi
-
-  if have setsid; then
-    setsid bash -lc "cd \"$cwd\" && exec \"$RUNTIME_CLIENT\" --bus-name=\"$BUS_NAME\" --pass-env-matching='WINE*' --pass-env-matching='STEAM*' --pass-env-matching='PROTON*' --env=SteamGameId=$APPID -- \"$WINELOADER\" \"$exe\"" >>"$log_file" 2>&1 < /dev/null &
-    TOOL_PGIDS+=("$!")
-  else
-    ( cd "$cwd" && "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- "$WINELOADER" "$exe" >>"$log_file" 2>&1 < /dev/null ) &
-    TOOL_PGIDS+=("$!")
-  fi
-}
-
-wait_for_process() {
-  local pattern="$1" timeout="$2"
-  local i=0
-  while (( i < timeout )); do
-    pgrep -f "$pattern" >/dev/null 2>&1 && return 0
-    sleep 1
-    i=$((i+1))
-  done
+  p="$(ls -1d "$HOME"/.steam/steam/compatibilitytools.d/*/proton 2>/dev/null | head -n1 || true)"
+  [[ -n "$p" && -x "$p" ]] && { printf '%s' "$p"; return 0; }
   return 1
 }
 
 wait_for_process_any() {
-  local timeout="$1"
-  shift
-
-  local i=0
+  local timeout="$1"; shift
+  local i=0 p
   while (( i < timeout )); do
-    local pattern
-    for pattern in "$@"; do
-      if pgrep -f "$pattern" >/dev/null 2>&1; then
-        return 0
-      fi
-    done
-    sleep 1
-    i=$((i+1))
+    for p in "$@"; do pgrep -f "$p" >/dev/null 2>&1 && return 0; done
+    sleep 1; i=$((i+1))
   done
-
   return 1
 }
 
-stop_tools() {
-  if [[ "${#TOOL_PGIDS[@]}" -eq 0 ]]; then
-    return 0
-  fi
+is_elite_running() { pgrep -f 'EliteDangerous64\.exe|EDLaunch\.exe' >/dev/null 2>&1; }
 
-  wlog "Stopping tools..."
-  # First try graceful
-  for pid in "${TOOL_PGIDS[@]}"; do
-    kill -TERM "$pid" >/dev/null 2>&1 || true
-  done
+# state enum via functions
+STATE_WAIT_LAUNCHER() { :; }
+STATE_WAIT_GAME() { :; }
+STATE_LAUNCH_EDCOPILOT() { :; }
+STATE_WAIT_EDCOPILOT_GUI() { :; }
+STATE_LAUNCH_AUX() { :; }
+STATE_MONITOR() { :; }
+STATE_SHUTDOWN() { :; }
+
+CURRENT_STATE="STATE_WAIT_LAUNCHER"
+
+declare -a CHILD_PIDS=()
+register_child() { CHILD_PIDS+=("$1"); }
+
+cleanup_children() {
+  local pid
+  for pid in "${CHILD_PIDS[@]:-}"; do kill -TERM "$pid" >/dev/null 2>&1 || true; done
   sleep 1
-  # Then force
-  for pid in "${TOOL_PGIDS[@]}"; do
-    kill -KILL "$pid" >/dev/null 2>&1 || true
-  done
+  for pid in "${CHILD_PIDS[@]:-}"; do kill -KILL "$pid" >/dev/null 2>&1 || true; done
 }
 
-stop_wineserver() {
-  if [[ -x "$WINESERVER" ]]; then
-    wlog "Stopping wineserver..."
-    "$WINESERVER" -k >/dev/null 2>&1 || true
-    "$WINESERVER" -w >/dev/null 2>&1 || true
-  fi
+launch_wine_child() {
+  local label="$1"; shift
+  local log_file="$LOG_DIR/${label}.log"
+  [[ "$DRY_RUN" -eq 1 ]] && { log "DRY-RUN child[$label]: $*"; return 0; }
+  "$@" >>"$log_file" 2>&1 &
+  register_child "$!"
 }
 
-# Graceful EDCoPilot shutdown (optional)
-request_edcopilot_shutdown() {
-  local exe="$1"
-  local dir
-  dir="$(dirname "$exe")"
-  local req="$dir/EDCoPilot.request.txt"
-
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    wlog "DRY-RUN: would request EDCoPilot shutdown: $req"
-    return 0
-  fi
-
-  if pgrep -f 'EDCoPilotGUI2\.exe' >/dev/null 2>&1; then
-    wlog "Requesting EDCoPilot graceful shutdown"
-    echo Shutdown >> "$req" || true
-  fi
-}
-
-# ----------------------------
-# Tool resolution from INI tool sections
-# ----------------------------
-# Each [tool.name] can specify:
-# enabled=true/false
-# kind=wine|runtime|auto|edcopilot|edcopter
-# when=pre|post|always|standalone
-# path=... (supports {prefix}, etc)
-
-resolve_tool_path() {
-  local name="$1"
-  local raw
-  raw="$(cfg_get "tool.$name.path" "")"
-  [[ -n "$raw" ]] || { printf '%s' ""; return 0; }
-  raw="$(expand_tokens "$raw" "$APPID" "$STEAM_ROOT" "$COMPATDATA_DIR" "$WINEPREFIX")"
-  printf '%s' "$raw"
-}
-
-# ----------------------------
-# Game launch command builder
-# ----------------------------
-# Returns: echoes a shell-escaped command line for logs
-# Also sets two globals:
-#   GAME_CMD_KIND = mined|steam|steam_applaunch
-#   GAME_CMD_ARR  = array of argv to exec
-
-GAME_CMD_KIND=""
-GAME_WORKDIR=""
-declare -a GAME_CMD_ARR=()
-
-split_words_to_array() {
-  # naive split for flag strings (space-separated). we intentionally keep it simple.
-  # If you need quoted values, set them via CLI rather than INI.
-  local s="$1"
-  local -n out="$2"
-  out=()
-  # shellcheck disable=SC2206
-  out=( $s )
-}
-
-array_contains() {
-  local needle="$1"
-  shift
-  local item
-  for item in "$@"; do
-    if [[ "$item" == "$needle" ]]; then
+launch_edcopilot() {
+  local mode="$1"
+  if [[ "$mode" == "runtime" || ( "$mode" == "auto" && -n "$RUNTIME_CLIENT" ) ]]; then
+    if [[ -x "${RUNTIME_CLIENT:-}" ]]; then
+      launch_wine_child "edcopilot" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- "$WINELOADER" "$EDCOPILOT_EXE"
       return 0
     fi
-  done
-  return 1
-}
-
-print_cmd() {
-  printf '%q ' "$@"; printf '\n'
+  fi
+  launch_wine_child "edcopilot" "$PROTON_BIN" run "$EDCOPILOT_EXE"
 }
 
 build_game_command() {
-  local mode="$1"
+  GAME_CMD_KIND=""
+  GAME_WORKDIR=""
+  GAME_CMD_ARR=()
 
-  # If Steam passed us %command% expansion, it should be in FORWARDED_CMD.
-  local have_forwarded=0
-  if [[ "${#FORWARDED_CMD[@]}" -gt 0 ]]; then
-    # If user ran from terminal and literally typed %command%, it will be literal.
-    if [[ "${FORWARDED_CMD[0]:-}" != "%command%" ]]; then
-      have_forwarded=1
-    fi
-  fi
-
-  local mined_exe="$(cfg_get 'elite.mined_exe' '')"
-  if [[ -z "$mined_exe" ]]; then
-    mined_exe="$(find_mined_exe "$APPID" "$STEAM_ROOT" "$LIBVDF" || true)"
-  fi
-
-  local -a mined_flags
-  split_words_to_array "$ELITE_MINED_FLAGS" mined_flags
-
-  local -a mined_args
-  mined_args=( "${mined_flags[@]}" )
-
-  # Profile routing is optional; do not force it unless explicitly configured.
-  # Keep product flags (/edo, etc.) authoritative to avoid interactive prompts.
-  if [[ -n "$ELITE_PROFILE" ]] && ! array_contains "/frontier" "${mined_flags[@]}"; then
-    mined_args=( "${mined_args[@]}" "/frontier" "$ELITE_PROFILE" )
-  fi
-
-  if [[ "$mode" == "mined" || "$mode" == "auto" ]]; then
-    if [[ -n "$mined_exe" && -f "$mined_exe" ]]; then
-      GAME_CMD_KIND="mined"
-      GAME_WORKDIR="$(dirname "$mined_exe")"
-      GAME_CMD_ARR=( "$PROTON_BIN" run "$mined_exe" "${mined_args[@]}" )
-      return 0
-    fi
-  fi
-
-  if [[ "$mode" == "steam" || "$mode" == "auto" ]]; then
-    if (( have_forwarded == 1 )); then
-      GAME_CMD_KIND="steam"
-      GAME_WORKDIR=""
-      GAME_CMD_ARR=( "${FORWARDED_CMD[@]}" )
-      return 0
-    fi
-  fi
-
-  # Terminal fallback
-  local tmode="$TERMINAL_MODE"
-  if [[ "$tmode" == "auto" ]]; then
-    # prefer steam_applaunch if no mined
-    tmode="steam_applaunch"
-  fi
-
-  if [[ "$tmode" == "steam_applaunch" ]]; then
-    if have steam; then
-      GAME_CMD_KIND="steam_applaunch"
-      GAME_WORKDIR=""
-      GAME_CMD_ARR=( steam -applaunch "$APPID" )
-      return 0
-    fi
-  fi
-
-  die "Unable to build game command. Set elite.mined_exe or provide -- %command% from Steam."
-}
-
-# ----------------------------
-# Watcher main
-# ----------------------------
-watcher_main() {
-  # Watcher gets its own log
-  : > "$WATCHER_LOG" || true
-
-  wlog "Watcher started"
-  wlog "mode=$WATCHER_LAUNCH_MODE game_pid=${WATCHER_GAME_PID:-<none>}"
-
-  # Optional HOTAS fix
-  apply_hotas_fix "$HOTAS_FIX_ENABLED"
-
-  # Generic tools: pre/always
-  for name in "${!TOOL_NAMES[@]}"; do
-    local enabled="$(cfg_get "tool.$name.enabled" "false")"
-    [[ "$enabled" == "true" ]] || continue
-
-    local when="$(cfg_get "tool.$name.when" "always")"
-    local kind="$(cfg_get "tool.$name.kind" "auto")"
-    local path
-    path="$(resolve_tool_path "$name")"
-
-    [[ -n "$path" && -f "$path" ]] || { wwarn "Tool $name path missing: $path"; continue; }
-
-    if [[ "$when" == "pre" || "$when" == "always" ]]; then
-      case "$kind" in
-        runtime)
-          start_tool_runtime_detached "$path" "tool_${name}" || start_tool_wine_detached "$path" "tool_${name}";;
-        wine)
-          start_tool_wine_detached "$path" "tool_${name}";;
-        auto)
-          # try runtime if bus is present quickly
-          if bus_available "$BUS_NAME"; then
-            start_tool_runtime_detached "$path" "tool_${name}" || start_tool_wine_detached "$path" "tool_${name}"
-          else
-            start_tool_wine_detached "$path" "tool_${name}"
-          fi
-          ;;
-        *)
-          start_tool_wine_detached "$path" "tool_${name}";;
-      esac
-    fi
-  done
-
-  # CLI tools: treat as pre tools unless they look like EDCoPilot
-  for t in "${CLI_TOOLS[@]}"; do
-    local base
-    base="$(basename "$t")"
-    if [[ "${base,,}" == *edcopilot* ]]; then
-      continue
-    fi
-    start_tool_wine_detached "$t" "cli_${base//[^A-Za-z0-9._-]/_}"
-  done
-
-  # EDCoPilot
-  if [[ "$EDCOPILOT_ENABLED" == "true" ]]; then
-    if [[ -f "$EDCOPILOT_EXE" ]]; then
-      patch_edcopilot_linux_flag "$EDCOPILOT_FORCE_LINUX_FLAG" "$EDCOPILOT_EXE"
-
-      # If not standalone and game isn't running, skip
-      if [[ "$EDCOPILOT_STANDALONE" != "true" && ! $(is_elite_running && echo true || echo false) ]]; then
-        wwarn "EDCoPilot standalone disabled and Elite not running; skipping."
-      else
-        wlog "EDCoPilot delay=${EDCOPILOT_DELAY}s"
-        sleep "$EDCOPILOT_DELAY" || true
-
-        local attempt=1
-        local launched=0
-        while (( attempt <= EDCOPILOT_RETRIES )); do
-          wlog "Launching EDCoPilot attempt $attempt/$EDCOPILOT_RETRIES (mode=$EDCOPILOT_MODE)"
-
-          case "$EDCOPILOT_MODE" in
-            runtime)
-              if wait_for_bus "$BUS_NAME" "$EDCOPILOT_BUS_WAIT"; then
-                start_tool_runtime_detached "$EDCOPILOT_EXE" "edcopilot" || true
-              else
-                wwarn "Runtime mode requested but bus not available after ${EDCOPILOT_BUS_WAIT}s: $BUS_NAME"
-              fi
-              ;;
-            wine)
-              start_tool_wine_detached "$EDCOPILOT_EXE" "edcopilot";;
-            auto)
-              # try runtime if bus appears within bus_wait, else wine
-              if [[ -n "${RUNTIME_CLIENT:-}" && -x "${RUNTIME_CLIENT:-}" ]]; then
-                if wait_for_bus "$BUS_NAME" "$EDCOPILOT_BUS_WAIT"; then
-                  start_tool_runtime_detached "$EDCOPILOT_EXE" "edcopilot" || start_tool_wine_detached "$EDCOPILOT_EXE" "edcopilot"
-                else
-                  start_tool_wine_detached "$EDCOPILOT_EXE" "edcopilot"
-                fi
-              else
-                start_tool_wine_detached "$EDCOPILOT_EXE" "edcopilot"
-              fi
-              ;;
-            *)
-              start_tool_wine_detached "$EDCOPILOT_EXE" "edcopilot";;
-          esac
-
-          # Wait for GUI (different versions can use different exe names)
-          if wait_for_process_any "$EDCOPILOT_INIT_TIMEOUT" 'EDCoPilotGUI2\.exe' 'EDCoPilotGUI\.exe' 'LaunchEDCoPilot\.exe'; then
-            wlog "EDCoPilot GUI detected."
-            launched=1
-            break
-          else
-            wwarn "EDCoPilot GUI not detected after ${EDCOPILOT_INIT_TIMEOUT}s"
-            if (( attempt < EDCOPILOT_RETRIES )); then
-              wlog "Retry sleep: ${EDCOPILOT_RETRY_SLEEP}s"
-              sleep "$EDCOPILOT_RETRY_SLEEP" || true
-            fi
-          fi
-
-          attempt=$((attempt+1))
-        done
-
-        if (( launched == 0 )); then
-          wwarn "EDCoPilot did not reach GUI after retries. Check logs in: $DEFAULT_LOG_DIR"
-        fi
-      fi
-    else
-      wwarn "EDCoPilot enabled but exe not found: $EDCOPILOT_EXE"
-    fi
-  fi
-
-  # EDCoPTER (optional)
-  if [[ "$EDCOPTER_ENABLED" == "true" && -n "$EDCOPTER_EXE" && -f "$EDCOPTER_EXE" ]]; then
-    # Build args
-    local -a args=()
-    [[ "$EDCOPTER_HEADLESS" == "true" ]] && args+=("--headless")
-    [[ -n "$EDCOPTER_LISTEN_IP" ]] && args+=("--ip" "$EDCOPTER_LISTEN_IP")
-    [[ -n "$EDCOPTER_LISTEN_PORT" ]] && args+=("--port" "$EDCOPTER_LISTEN_PORT")
-    [[ -n "$EDCOPTER_EDCOPILOT_IP" ]] && args+=("--edcopilot-ip" "$EDCOPTER_EDCOPILOT_IP")
-
-    # extra args (simple split)
-    if [[ -n "$EDCOPTER_ARGS_EXTRA" ]]; then
-      local -a extra
-      split_words_to_array "$EDCOPTER_ARGS_EXTRA" extra
-      args+=("${extra[@]}")
-    fi
-
-    start_tool_wine_detached "$EDCOPTER_EXE" "edcopter"
-  fi
-
-  # Post tools
-  for name in "${!TOOL_NAMES[@]}"; do
-    local enabled="$(cfg_get "tool.$name.enabled" "false")"
-    [[ "$enabled" == "true" ]] || continue
-
-    local when="$(cfg_get "tool.$name.when" "always")"
-    local kind="$(cfg_get "tool.$name.kind" "auto")"
-    local path
-    path="$(resolve_tool_path "$name")"
-
-    [[ -n "$path" && -f "$path" ]] || continue
-
-    if [[ "$when" == "post" ]]; then
-      case "$kind" in
-        runtime)
-          start_tool_runtime_detached "$path" "tool_${name}" || start_tool_wine_detached "$path" "tool_${name}";;
-        wine)
-          start_tool_wine_detached "$path" "tool_${name}";;
-        auto)
-          if bus_available "$BUS_NAME"; then
-            start_tool_runtime_detached "$path" "tool_${name}" || start_tool_wine_detached "$path" "tool_${name}"
-          else
-            start_tool_wine_detached "$path" "tool_${name}"
-          fi
-          ;;
-        *)
-          start_tool_wine_detached "$path" "tool_${name}";;
-      esac
-    fi
-  done
-
-  # Tools-only watcher behavior
-  if [[ "$NO_GAME" -eq 1 ]]; then
-    wlog "Tools-only watcher active."
-    if [[ "$WAIT_TOOLS" -eq 1 ]]; then
-      wlog "--wait-tools enabled: blocking until Ctrl+C"
-      while true; do sleep 2; done
-    else
-      wlog "Tools-only: detached; exiting watcher."
-    fi
+  if (( ${#FORWARDED_CMD[@]} > 0 )) && [[ "${FORWARDED_CMD[0]}" != "%command%" ]]; then
+    GAME_CMD_KIND="steam"
+    GAME_CMD_ARR=("${FORWARDED_CMD[@]}")
     return 0
   fi
 
-  # Monitor game and shutdown tools when it exits (optional)
-  if [[ "$ELITE_MONITOR_GAME" == "true" ]]; then
-    wlog "Monitoring Elite processes..."
-
-    # Prefer explicit PID (from Steam exec) if provided
-    if [[ -n "$WATCHER_GAME_PID" ]]; then
-      while kill -0 "$WATCHER_GAME_PID" >/dev/null 2>&1; do
-        sleep 5
-      done
-    else
-      # fallback: poll for Elite processes
-      while is_elite_running; do
-        sleep 5
-      done
-    fi
-
-    wlog "Elite exited."
-
-    # EDCoPilot graceful request
-    if [[ "$EDCOPILOT_ENABLED" == "true" && -f "$EDCOPILOT_EXE" ]]; then
-      request_edcopilot_shutdown "$EDCOPILOT_EXE"
-      # give a moment
-      sleep 2 || true
-    fi
-
-    stop_tools
-    stop_wineserver
-  else
-    wlog "monitor_game=false; watcher will exit without stopping tools."
+  local mined_exe
+  mined_exe="$(cfg_get 'elite.mined_exe' '')"
+  [[ -z "$mined_exe" ]] && mined_exe="$STEAM_ROOT/steamapps/common/Elite Dangerous/MinEdLauncher.exe"
+  if [[ -f "$mined_exe" ]]; then
+    GAME_CMD_KIND="mined"
+    GAME_WORKDIR="$(dirname "$mined_exe")"
+    GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe")
+    return 0
   fi
+
+  die "Unable to build game command. Pass Steam %command% or set elite.mined_exe"
 }
 
-# ----------------------------
-# Main: tools-only vs game
-# ----------------------------
-if [[ "$WATCHER_MODE" -eq 1 ]]; then
-  watcher_main
-  exit 0
-fi
+ini_load "$CONFIG_PATH"
 
-# Tools-only mode: run watcher directly (no exec)
-if [[ "$NO_GAME" -eq 1 ]]; then
-  log "Tools-only mode."
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    log "DRY-RUN: would start watcher tools-only."
-    exit 0
-  fi
+phase_start "bootstrap"
+APPID="$(cfg_get 'steam.appid' "${SteamGameId:-359320}")"
+BUS_NAME="com.steampowered.App$APPID"
+EDCOPILOT_ENABLED="$(cfg_bool 'edcopilot.enabled' 'true')"
+EDCOPILOT_MODE="$(cfg_get 'edcopilot.mode' 'auto')"
+EDCOPILOT_DELAY="$(cfg_int 'edcopilot.delay' '30' '0')"
+EDCOPILOT_INIT_TIMEOUT="$(cfg_int 'edcopilot.init_timeout' '45' '1')"
+EDCOPILOT_EXE_REL="$(cfg_get 'edcopilot.exe_rel' 'drive_c/EDCoPilot/LaunchEDCoPilot.exe')"
+EDCOPTER_ENABLED="$(cfg_bool 'edcopter.enabled' 'false')"
+EDCOPTER_EXE_REL="$(cfg_get 'edcopter.exe_rel' '')"
+phase_end "bootstrap"
 
-  # Start watcher (not necessarily detached if wait-tools)
-  if [[ "$WAIT_TOOLS" -eq 1 ]]; then
-    "$0" --config "$CONFIG_PATH" --no-game --wait-tools --watcher "" "tools" &
-    wait $! || true
-  else
-    if have setsid; then
-      setsid "$0" --config "$CONFIG_PATH" --no-game --watcher "" "tools" >>"$WATCHER_LOG" 2>&1 < /dev/null &
-    else
-      "$0" --config "$CONFIG_PATH" --no-game --watcher "" "tools" >>"$WATCHER_LOG" 2>&1 < /dev/null &
-    fi
-  fi
-  exit 0
-fi
+phase_start "detect steam/prefix/runtime"
+STEAM_ROOT="$(cfg_get 'steam.steam_root' '')"
+[[ -z "$STEAM_ROOT" ]] && STEAM_ROOT="$(detect_steam_root || true)"
+[[ -n "$STEAM_ROOT" && -d "$STEAM_ROOT" ]] || { phase_fail "detect steam/prefix/runtime" "steam root not found"; die "steam root not found"; }
+COMPATDATA_DIR="$(cfg_get 'steam.compatdata_dir' "${STEAM_COMPAT_DATA_PATH:-$STEAM_ROOT/steamapps/compatdata/$APPID}")"
+WINEPREFIX="$COMPATDATA_DIR/pfx"
+[[ -d "$WINEPREFIX" ]] || { phase_fail "detect steam/prefix/runtime" "wineprefix not found"; die "WINEPREFIX not found: $WINEPREFIX"; }
+RUNTIME_CLIENT="$(cfg_get 'steam.runtime_client' '')"
+[[ -z "$RUNTIME_CLIENT" ]] && RUNTIME_CLIENT="$(detect_runtime_client "$STEAM_ROOT" || true)"
+PROTON_BIN="$(cfg_get 'proton.proton' '')"
+[[ -z "$PROTON_BIN" ]] && PROTON_BIN="$(find_proton "$STEAM_ROOT" || true)"
+[[ -n "$PROTON_BIN" && -x "$PROTON_BIN" ]] || { phase_fail "detect steam/prefix/runtime" "proton not found"; die "proton not found"; }
+WINELOADER="$(dirname "$PROTON_BIN")/files/bin/wine"
+EDCOPILOT_EXE="$(cfg_get 'edcopilot.exe' '')"
+[[ -z "$EDCOPILOT_EXE" ]] && EDCOPILOT_EXE="$WINEPREFIX/$EDCOPILOT_EXE_REL"
+EDCOPTER_EXE=""
+[[ -n "$EDCOPTER_EXE_REL" ]] && EDCOPTER_EXE="$WINEPREFIX/$EDCOPTER_EXE_REL"
+export WINEPREFIX STEAM_COMPAT_DATA_PATH="$COMPATDATA_DIR" STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT" SteamGameId="$APPID" WINEDEBUG="-all"
+phase_end "detect steam/prefix/runtime"
 
-# Build game command
-build_game_command "$ELITE_LAUNCH_MODE"
-
-log "Game launch kind=$GAME_CMD_KIND"
-log "Game workdir=${GAME_WORKDIR:-<none>}"
-log "Game command: $(print_cmd "${GAME_CMD_ARR[@]}")"
-
-# Spawn watcher detached before exec
-if [[ "$DRY_RUN" -eq 1 ]]; then
-  log "DRY-RUN: would spawn watcher + exec into game."
-  exit 0
-fi
-
-if have setsid; then
-  setsid "$0" --config "$CONFIG_PATH" --watcher "$$" "$GAME_CMD_KIND" >>"$WATCHER_LOG" 2>&1 < /dev/null &
+phase_start "detect launcher/game"
+if [[ "$NO_GAME" -eq 0 ]]; then
+  build_game_command
+  log "Game launch kind=$GAME_CMD_KIND"
+  log "Game command=$(printf '%q ' "${GAME_CMD_ARR[@]}")"
 else
-  "$0" --config "$CONFIG_PATH" --watcher "$$" "$GAME_CMD_KIND" >>"$WATCHER_LOG" 2>&1 < /dev/null &
+  log "No-game mode enabled"
 fi
+phase_end "detect launcher/game"
 
-# If launching MinEd, run from MinEd's directory for reliable autorun/profile behavior.
-if [[ -n "$GAME_WORKDIR" && -d "$GAME_WORKDIR" ]]; then
-  cd "$GAME_WORKDIR"
-fi
+GAME_PID=""
 
-# Exec into game so Steam tracks this PID as the game
-exec "${GAME_CMD_ARR[@]}"
+while true; do
+  case "$CURRENT_STATE" in
+    STATE_WAIT_LAUNCHER)
+      phase_start "STATE_WAIT_LAUNCHER"
+      if [[ "$NO_GAME" -eq 0 ]]; then
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+          log "DRY-RUN would launch game command"
+        else
+          [[ -n "$GAME_WORKDIR" ]] && cd "$GAME_WORKDIR"
+          "${GAME_CMD_ARR[@]}" &
+          GAME_PID="$!"
+          register_child "$GAME_PID"
+          log "Game process started pid=$GAME_PID"
+        fi
+      fi
+      CURRENT_STATE="STATE_WAIT_GAME"
+      phase_end "STATE_WAIT_LAUNCHER"
+      ;;
+    STATE_WAIT_GAME)
+      phase_start "STATE_WAIT_GAME"
+      if [[ "$NO_GAME" -eq 1 ]] || [[ "$DRY_RUN" -eq 1 ]]; then
+        log "Skipping wait for game in no-game/dry-run"
+      else
+        local_wait=0
+        until is_elite_running || (( local_wait >= 120 )); do sleep 2; local_wait=$((local_wait+2)); done
+        is_elite_running && log "Elite process detected" || warn "Elite process not detected within timeout; continuing"
+      fi
+      CURRENT_STATE="STATE_LAUNCH_EDCOPILOT"
+      phase_end "STATE_WAIT_GAME"
+      ;;
+    STATE_LAUNCH_EDCOPILOT)
+      phase_start "STATE_LAUNCH_EDCOPILOT"
+      if [[ "$EDCOPILOT_ENABLED" == "true" && -f "$EDCOPILOT_EXE" ]]; then
+        [[ "$EDCOPILOT_DELAY" -gt 0 ]] && sleep "$EDCOPILOT_DELAY"
+        launch_edcopilot "$EDCOPILOT_MODE"
+      else
+        warn "EDCoPilot disabled or missing exe: $EDCOPILOT_EXE"
+      fi
+      CURRENT_STATE="STATE_WAIT_EDCOPILOT_GUI"
+      phase_end "STATE_LAUNCH_EDCOPILOT"
+      ;;
+    STATE_WAIT_EDCOPILOT_GUI)
+      phase_start "STATE_WAIT_EDCOPILOT_GUI"
+      if [[ "$EDCOPILOT_ENABLED" == "true" && -f "$EDCOPILOT_EXE" && "$DRY_RUN" -eq 0 ]]; then
+        if wait_for_process_any "$EDCOPILOT_INIT_TIMEOUT" 'EDCoPilotGUI2\.exe' 'EDCoPilotGUI\.exe' 'LaunchEDCoPilot\.exe'; then
+          log "EDCoPilot GUI detected"
+        else
+          phase_fail "STATE_WAIT_EDCOPILOT_GUI" "GUI not detected in timeout"
+          warn "EDCoPilot GUI not detected after ${EDCOPILOT_INIT_TIMEOUT}s"
+        fi
+      fi
+      CURRENT_STATE="STATE_LAUNCH_AUX"
+      phase_end "STATE_WAIT_EDCOPILOT_GUI"
+      ;;
+    STATE_LAUNCH_AUX)
+      phase_start "STATE_LAUNCH_AUX"
+      if [[ "$EDCOPTER_ENABLED" == "true" && -n "$EDCOPTER_EXE" && -f "$EDCOPTER_EXE" ]]; then
+        launch_wine_child "edcopter" "$PROTON_BIN" run "$EDCOPTER_EXE"
+      fi
+      for t in "${CLI_TOOLS[@]}"; do
+        [[ -f "$t" ]] || { warn "tool not found: $t"; continue; }
+        launch_wine_child "tool_$(basename "$t")" "$PROTON_BIN" run "$t"
+      done
+      CURRENT_STATE="STATE_MONITOR"
+      phase_end "STATE_LAUNCH_AUX"
+      ;;
+    STATE_MONITOR)
+      phase_start "STATE_MONITOR"
+      if [[ "$NO_GAME" -eq 1 ]]; then
+        if [[ "$WAIT_TOOLS" -eq 1 ]]; then
+          log "No-game monitor active (--wait-tools); Ctrl+C to exit"
+          while true; do sleep 5; done
+        fi
+      elif [[ "$DRY_RUN" -eq 0 ]]; then
+        if [[ -n "$GAME_PID" ]]; then
+          while kill -0 "$GAME_PID" >/dev/null 2>&1; do sleep 5; done
+        else
+          while is_elite_running; do sleep 5; done
+        fi
+        log "Game ended; transitioning to shutdown"
+      fi
+      CURRENT_STATE="STATE_SHUTDOWN"
+      phase_end "STATE_MONITOR"
+      ;;
+    STATE_SHUTDOWN)
+      phase_start "STATE_SHUTDOWN"
+      cleanup_children
+      if [[ -x "$(dirname "$PROTON_BIN")/files/bin/wineserver" ]]; then
+        "$(dirname "$PROTON_BIN")/files/bin/wineserver" -k >/dev/null 2>&1 || true
+      fi
+      phase_end "STATE_SHUTDOWN"
+      break
+      ;;
+    *) die "Unknown state: $CURRENT_STATE" ;;
+  esac
+done
+
+log "Coordinator finished"
