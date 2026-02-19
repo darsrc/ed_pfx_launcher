@@ -51,6 +51,7 @@ done
 
 # INI parsing
 declare -A CFG=()
+declare -A CFG_SOURCE=()
 _trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
 _unquote() { local s="$1"; [[ "$s" =~ ^".*"$ ]] && s="${s:1:${#s}-2}"; [[ "$s" =~ ^'.*'$ ]] && s="${s:1:${#s}-2}"; printf '%s' "$s"; }
 
@@ -76,6 +77,7 @@ ini_load() {
 }
 
 cfg_get() { printf '%s' "${CFG[$1]:-${2:-}}"; }
+cfg_has() { [[ -n "${CFG[$1]+x}" ]]; }
 cfg_bool() {
   local v="$(cfg_get "$1" "${2:-false}")"
   case "${v,,}" in true|false) printf '%s' "${v,,}" ;; *) printf '%s' "${2:-false}" ;; esac
@@ -84,6 +86,64 @@ cfg_int() {
   local raw="$(cfg_get "$1" "$2")"
   [[ "$raw" =~ ^[0-9]+$ ]] && (( raw >= $3 )) && { printf '%s' "$raw"; return; }
   printf '%s' "$2"
+}
+
+cfg_select() {
+  local target="$1" default="$2"
+  shift 2
+  local key="" val=""
+  CFG_SOURCE["$target"]="default"
+
+  for key in "$@"; do
+    if cfg_has "$key"; then
+      val="$(cfg_get "$key")"
+      if [[ "$key" == "$target" ]]; then
+        CFG_SOURCE["$target"]="config:$key"
+      else
+        CFG_SOURCE["$target"]="compat:$key"
+        warn "Deprecated config key '$key' is in use; migrate to '$target'"
+      fi
+      printf '%s' "$val"
+      return 0
+    fi
+  done
+
+  printf '%s' "$default"
+}
+
+cfg_select_bool() {
+  local target="$1" default="$2"
+  shift 2
+  local raw
+  raw="$(cfg_select "$target" "$default" "$@")"
+  case "${raw,,}" in true|false) printf '%s' "${raw,,}" ;; *) printf '%s' "$default" ;; esac
+}
+
+cfg_select_int() {
+  local target="$1" default="$2" min="$3"
+  shift 3
+  local raw
+  raw="$(cfg_select "$target" "$default" "$@")"
+  if [[ "$raw" =~ ^[0-9]+$ ]] && (( raw >= min )); then
+    printf '%s' "$raw"
+    return 0
+  fi
+  printf '%s' "$default"
+}
+
+log_effective_config() {
+  log "Effective startup configuration:"
+  log "  detection.launcher_timeout=$LAUNCHER_DETECT_TIMEOUT source=${CFG_SOURCE[detection.launcher_timeout]}"
+  log "  detection.game_timeout=$GAME_DETECT_TIMEOUT source=${CFG_SOURCE[detection.game_timeout]}"
+  log "  edcopilot.enabled=$EDCOPILOT_ENABLED source=${CFG_SOURCE[edcopilot.enabled]}"
+  log "  edcopilot.exe=$EDCOPILOT_EXE source=${CFG_SOURCE[edcopilot.exe]}"
+  log "  edcopilot.mode=$EDCOPILOT_MODE source=${CFG_SOURCE[edcopilot.mode]}"
+  log "  edcopilot.startup_delay=$EDCOPILOT_DELAY source=${CFG_SOURCE[edcopilot.startup_delay]}"
+  log "  edcopilot.bus_wait=$EDCOPILOT_BUS_WAIT source=${CFG_SOURCE[edcopilot.bus_wait]}"
+  log "  edcopilot.init_timeout=$EDCOPILOT_INIT_TIMEOUT source=${CFG_SOURCE[edcopilot.init_timeout]}"
+  log "  edcopilot.graceful_shutdown_timeout=$EDCOPILOT_SHUTDOWN_TIMEOUT source=${CFG_SOURCE[edcopilot.graceful_shutdown_timeout]}"
+  log "  shutdown.monitor_target=$SHUTDOWN_MONITOR_TARGET source=${CFG_SOURCE[shutdown.monitor_target]}"
+  log "  shutdown.wineserver_cleanup=$WINESERVER_CLEANUP source=${CFG_SOURCE[shutdown.wineserver_cleanup]}"
 }
 
 expand_tokens() {
@@ -472,8 +532,15 @@ launch_edcopilot_runtime() {
 
 launch_edcopilot() {
   local mode="$1" runtime_client=""
+  local waited=0
 
-  runtime_client="$(resolve_runtime_client_from_processes || true)"
+  while (( waited < EDCOPILOT_BUS_WAIT )); do
+    runtime_client="$(resolve_runtime_client_from_processes || true)"
+    [[ -n "$runtime_client" ]] && break
+    sleep 1
+    waited=$((waited + 1))
+  done
+
   if [[ -n "$runtime_client" ]]; then
     RUNTIME_CLIENT="$runtime_client"
     log "Resolved runtime client from running process: $RUNTIME_CLIENT"
@@ -527,22 +594,27 @@ ini_load "$CONFIG_PATH"
 phase_start "bootstrap"
 APPID="$(cfg_get 'steam.appid' "${SteamGameId:-359320}")"
 BUS_NAME="com.steampowered.App$APPID"
-EDCOPILOT_ENABLED="$(cfg_bool 'edcopilot.enabled' 'true')"
-EDCOPILOT_MODE="$(cfg_get 'edcopilot.mode' 'auto')"
-EDCOPILOT_DELAY="$(cfg_int 'edcopilot.delay' '30' '0')"
-EDCOPILOT_INIT_TIMEOUT="$(cfg_int 'edcopilot.init_timeout' '45' '1')"
-EDCOPILOT_SHUTDOWN_TIMEOUT="$(cfg_int 'edcopilot.shutdown_timeout' '15' '1')"
+EDCOPILOT_ENABLED="$(cfg_select_bool 'edcopilot.enabled' 'true' 'edcopilot.enabled')"
+EDCOPILOT_MODE="$(cfg_select 'edcopilot.mode' 'runtime' 'edcopilot.mode')"
+EDCOPILOT_DELAY="$(cfg_select_int 'edcopilot.startup_delay' '30' '0' 'edcopilot.startup_delay' 'edcopilot.delay')"
+EDCOPILOT_BUS_WAIT="$(cfg_select_int 'edcopilot.bus_wait' '30' '0' 'edcopilot.bus_wait')"
+EDCOPILOT_INIT_TIMEOUT="$(cfg_select_int 'edcopilot.init_timeout' '45' '1' 'edcopilot.init_timeout')"
+EDCOPILOT_SHUTDOWN_TIMEOUT="$(cfg_select_int 'edcopilot.graceful_shutdown_timeout' '15' '1' 'edcopilot.graceful_shutdown_timeout' 'edcopilot.shutdown_timeout')"
 EDCOPILOT_FORCE_KILL_TIMEOUT="$(cfg_int 'edcopilot.force_kill_timeout' '5' '1')"
 EDCOPILOT_ALLOW_PROTON_FALLBACK="$(cfg_bool 'edcopilot.allow_proton_fallback' 'false')"
 EDCOPILOT_FORCE_LINUX_FLAG="$(cfg_bool 'edcopilot.force_linux_flag' 'true')"
-LAUNCHER_DETECT_TIMEOUT="$(cfg_int 'elite.launcher_detect_timeout' '120' '1')"
-GAME_DETECT_TIMEOUT="$(cfg_int 'elite.game_detect_timeout' '120' '1')"
+LAUNCHER_DETECT_TIMEOUT="$(cfg_select_int 'detection.launcher_timeout' '120' '1' 'detection.launcher_timeout' 'elite.launcher_detect_timeout')"
+GAME_DETECT_TIMEOUT="$(cfg_select_int 'detection.game_timeout' '120' '1' 'detection.game_timeout' 'elite.game_detect_timeout')"
 EDCOPILOT_EXE_REL="$(cfg_get 'edcopilot.exe_rel' 'drive_c/EDCoPilot/LaunchEDCoPilot.exe')"
 EDCOPTER_ENABLED="$(cfg_bool 'edcopter.enabled' 'false')"
 EDCOPTER_SHUTDOWN_TIMEOUT="$(cfg_int 'edcopter.shutdown_timeout' '5' '1')"
 EDCOPTER_EXE_REL="$(cfg_get 'edcopter.exe_rel' '')"
-WINESERVER_KILL_ON_SHUTDOWN="$(cfg_bool 'wine.wineserver_kill_on_shutdown' 'false')"
-WINESERVER_WAIT_ON_SHUTDOWN="$(cfg_bool 'wine.wineserver_wait_on_shutdown' 'false')"
+SHUTDOWN_MONITOR_TARGET="$(cfg_select 'shutdown.monitor_target' 'game' 'shutdown.monitor_target')"
+case "$SHUTDOWN_MONITOR_TARGET" in
+  launcher|game) ;;
+  *) warn "Invalid shutdown.monitor_target='$SHUTDOWN_MONITOR_TARGET'; defaulting to game"; SHUTDOWN_MONITOR_TARGET='game'; CFG_SOURCE['shutdown.monitor_target']="default";;
+esac
+WINESERVER_CLEANUP="$(cfg_select_bool 'shutdown.wineserver_cleanup' 'false' 'shutdown.wineserver_cleanup' 'wine.wineserver_kill_on_shutdown' 'wine.wineserver_wait_on_shutdown')"
 phase_end "bootstrap"
 
 phase_start "detect steam/prefix/runtime"
@@ -560,10 +632,15 @@ PROTON_BIN="$(cfg_get 'proton.proton' '')"
 WINELOADER="$(dirname "$PROTON_BIN")/files/bin/wine"
 EDCOPILOT_EXE="$(cfg_get 'edcopilot.exe' '')"
 [[ -z "$EDCOPILOT_EXE" ]] && EDCOPILOT_EXE="$WINEPREFIX/$EDCOPILOT_EXE_REL"
+CFG_SOURCE['edcopilot.exe']="config:edcopilot.exe"
+if ! cfg_has 'edcopilot.exe'; then
+  CFG_SOURCE['edcopilot.exe']="default:edcopilot.exe_rel"
+fi
 prepare_edcopilot_config "$EDCOPILOT_FORCE_LINUX_FLAG"
 EDCOPTER_EXE=""
 [[ -n "$EDCOPTER_EXE_REL" ]] && EDCOPTER_EXE="$WINEPREFIX/$EDCOPTER_EXE_REL"
 export WINEPREFIX STEAM_COMPAT_DATA_PATH="$COMPATDATA_DIR" STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT" SteamGameId="$APPID" WINEDEBUG="-all"
+log_effective_config
 phase_end "detect steam/prefix/runtime"
 
 phase_start "detect launcher/game"
@@ -609,7 +686,14 @@ while true; do
           die "Launcher detection timed out after ${LAUNCHER_DETECT_TIMEOUT}s or game detection timed out after ${GAME_DETECT_TIMEOUT}s"
         fi
 
-        if [[ "$DETECTED_KIND" == "mined" ]]; then
+        if [[ "$SHUTDOWN_MONITOR_TARGET" == "launcher" && "$DETECTED_KIND" == "edlaunch" ]]; then
+          MONITOR_PID="$DETECTED_PID"
+          log "Monitor lifecycle token=launcher pid=$MONITOR_PID"
+        elif [[ "$SHUTDOWN_MONITOR_TARGET" == "launcher" ]]; then
+          warn "monitor_target=launcher requested but launcher process not detected; falling back to game"
+          MONITOR_PID="$DETECTED_PID"
+          log "Monitor lifecycle token=$DETECTED_KIND pid=$MONITOR_PID"
+        elif [[ "$DETECTED_KIND" == "mined" ]]; then
           MONITOR_PID="$DETECTED_PID"
           log "Monitor lifecycle token=game pid=$MONITOR_PID"
         elif [[ "$DETECTED_KIND" == "edlaunch" ]]; then
@@ -695,11 +779,9 @@ while true; do
       fi
       cleanup_children
       if [[ -x "$(dirname "$PROTON_BIN")/files/bin/wineserver" ]]; then
-        if [[ "$WINESERVER_KILL_ON_SHUTDOWN" == "true" ]]; then
+        if [[ "$WINESERVER_CLEANUP" == "true" ]]; then
           "$(dirname "$PROTON_BIN")/files/bin/wineserver" -k >/dev/null 2>&1 || true
           log "Ran wineserver -k"
-        fi
-        if [[ "$WINESERVER_WAIT_ON_SHUTDOWN" == "true" ]]; then
           "$(dirname "$PROTON_BIN")/files/bin/wineserver" -w >/dev/null 2>&1 || true
           log "Ran wineserver -w"
         fi
