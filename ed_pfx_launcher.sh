@@ -864,6 +864,18 @@ split_words_to_array() {
   out=( $s )
 }
 
+array_contains() {
+  local needle="$1"
+  shift
+  local item
+  for item in "$@"; do
+    if [[ "$item" == "$needle" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 print_cmd() {
   printf '%q ' "$@"; printf '\n'
 }
@@ -889,7 +901,13 @@ build_game_command() {
   split_words_to_array "$ELITE_MINED_FLAGS" mined_flags
 
   local -a mined_args
-  mined_args=( "${mined_flags[@]}" "/frontier" "$ELITE_PROFILE" )
+  mined_args=( "${mined_flags[@]}" )
+
+  # Profile routing is optional; do not force it unless explicitly configured.
+  # Keep product flags (/edo, etc.) authoritative to avoid interactive prompts.
+  if [[ -n "$ELITE_PROFILE" ]] && ! array_contains "/frontier" "${mined_flags[@]}"; then
+    mined_args=( "/frontier" "$ELITE_PROFILE" "${mined_args[@]}" )
+  fi
 
   if [[ "$mode" == "mined" || "$mode" == "auto" ]]; then
     if [[ -n "$mined_exe" && -f "$mined_exe" ]]; then
