@@ -243,6 +243,61 @@ launch_wine_child() {
   register_child "$!"
 }
 
+log_edcopilot_tail() {
+  local log_file="$LOG_DIR/edcopilot.log"
+  if [[ -f "$log_file" ]]; then
+    warn "Last 60 lines from $log_file"
+    tail -n 60 "$log_file" | while IFS= read -r line; do
+      warn "[edcopilot.log] $line"
+    done
+  else
+    warn "EDCoPilot log not found at $log_file"
+  fi
+}
+
+launch_edcopilot_runtime() {
+  local runtime_client="$1"
+  local log_file="$LOG_DIR/edcopilot.log"
+  local pid=""
+  local elapsed=0
+
+  [[ "$DRY_RUN" -eq 1 ]] && {
+    log "DRY-RUN child[edcopilot]: $runtime_client --bus-name=\"com.steampowered.App${APPID}\" --pass-env-matching=\"WINE*\" --pass-env-matching=\"STEAM*\" --pass-env-matching=\"PROTON*\" --env=\"SteamGameId=${APPID}\" -- \"$WINELOADER\" \"$EDCOPILOT_EXE\""
+    return 0
+  }
+
+  "$runtime_client" \
+    --bus-name="com.steampowered.App${APPID}" \
+    --pass-env-matching="WINE*" \
+    --pass-env-matching="STEAM*" \
+    --pass-env-matching="PROTON*" \
+    --env="SteamGameId=${APPID}" \
+    -- "$WINELOADER" "$EDCOPILOT_EXE" >>"$log_file" 2>&1 &
+  pid="$!"
+  register_child "$pid"
+  log "Started EDCoPilot runtime launch pid=$pid"
+
+  sleep 4
+  if ! kill -0 "$pid" >/dev/null 2>&1; then
+    warn "EDCoPilot runtime process exited during grace period (pid=$pid)"
+    log_edcopilot_tail
+    return 1
+  fi
+
+  while (( elapsed < EDCOPILOT_INIT_TIMEOUT )); do
+    if pgrep -f 'EDCoPilotGUI2\.exe' >/dev/null 2>&1; then
+      log "EDCoPilot GUI detected via EDCoPilotGUI2.exe"
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  warn "EDCoPilot GUI not detected after ${EDCOPILOT_INIT_TIMEOUT}s"
+  log_edcopilot_tail
+  return 1
+}
+
 launch_edcopilot() {
   local mode="$1" runtime_client=""
 
@@ -256,11 +311,19 @@ launch_edcopilot() {
 
   if [[ "$mode" == "runtime" || ( "$mode" == "auto" && -n "$RUNTIME_CLIENT" ) ]]; then
     if [[ -x "${RUNTIME_CLIENT:-}" ]]; then
-      launch_wine_child "edcopilot" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- "$WINELOADER" "$EDCOPILOT_EXE"
-      return 0
+      launch_edcopilot_runtime "$RUNTIME_CLIENT"
+      return $?
     fi
   fi
-  launch_wine_child "edcopilot" "$PROTON_BIN" run "$EDCOPILOT_EXE"
+
+  if [[ "$EDCOPILOT_ALLOW_PROTON_FALLBACK" == "true" ]]; then
+    log "Launching EDCoPilot via Proton fallback"
+    launch_wine_child "edcopilot" "$PROTON_BIN" run "$EDCOPILOT_EXE"
+    return 0
+  fi
+
+  warn "No runtime launch path available and Proton fallback is disabled"
+  return 1
 }
 
 build_game_command() {
@@ -296,6 +359,7 @@ EDCOPILOT_ENABLED="$(cfg_bool 'edcopilot.enabled' 'true')"
 EDCOPILOT_MODE="$(cfg_get 'edcopilot.mode' 'auto')"
 EDCOPILOT_DELAY="$(cfg_int 'edcopilot.delay' '30' '0')"
 EDCOPILOT_INIT_TIMEOUT="$(cfg_int 'edcopilot.init_timeout' '45' '1')"
+EDCOPILOT_ALLOW_PROTON_FALLBACK="$(cfg_bool 'edcopilot.allow_proton_fallback' 'false')"
 LAUNCHER_DETECT_TIMEOUT="$(cfg_int 'elite.launcher_detect_timeout' '120' '1')"
 GAME_DETECT_TIMEOUT="$(cfg_int 'elite.game_detect_timeout' '120' '1')"
 EDCOPILOT_EXE_REL="$(cfg_get 'edcopilot.exe_rel' 'drive_c/EDCoPilot/LaunchEDCoPilot.exe')"
@@ -384,7 +448,10 @@ while true; do
       phase_start "STATE_LAUNCH_EDCOPILOT"
       if [[ "$EDCOPILOT_ENABLED" == "true" && -f "$EDCOPILOT_EXE" ]]; then
         [[ "$EDCOPILOT_DELAY" -gt 0 ]] && sleep "$EDCOPILOT_DELAY"
-        launch_edcopilot "$EDCOPILOT_MODE"
+        if ! launch_edcopilot "$EDCOPILOT_MODE"; then
+          phase_fail "STATE_LAUNCH_EDCOPILOT" "EDCoPilot launch/verification failed"
+          die "EDCoPilot failed to launch or EDCoPilotGUI2.exe was not detected"
+        fi
       else
         warn "EDCoPilot disabled or missing exe: $EDCOPILOT_EXE"
       fi
@@ -393,14 +460,7 @@ while true; do
       ;;
     STATE_WAIT_EDCOPILOT_GUI)
       phase_start "STATE_WAIT_EDCOPILOT_GUI"
-      if [[ "$EDCOPILOT_ENABLED" == "true" && -f "$EDCOPILOT_EXE" && "$DRY_RUN" -eq 0 ]]; then
-        if wait_for_process_any "$EDCOPILOT_INIT_TIMEOUT" 'EDCoPilotGUI2\.exe' 'EDCoPilotGUI\.exe' 'LaunchEDCoPilot\.exe'; then
-          log "EDCoPilot GUI detected"
-        else
-          phase_fail "STATE_WAIT_EDCOPILOT_GUI" "GUI not detected in timeout"
-          warn "EDCoPilot GUI not detected after ${EDCOPILOT_INIT_TIMEOUT}s"
-        fi
-      fi
+      log "EDCoPilot GUI verification completed in launch phase"
       CURRENT_STATE="STATE_LAUNCH_AUX"
       phase_end "STATE_WAIT_EDCOPILOT_GUI"
       ;;
