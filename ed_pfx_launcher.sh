@@ -195,6 +195,49 @@ cfg_get() {
   printf '%s' "$v"
 }
 
+cfg_bool() {
+  local key="$1"
+  local raw def
+  raw="$(cfg_get "$key" "")"
+  def="${2:-false}"
+  raw="${raw,,}"
+
+  case "$raw" in
+    true|false)
+      printf '%s' "$raw"
+      ;;
+    "")
+      printf '%s' "$def"
+      ;;
+    *)
+      warn "Invalid boolean for $key='$raw'; using default '$def'"
+      printf '%s' "$def"
+      ;;
+  esac
+}
+
+cfg_int() {
+  local key="$1"
+  local def="$2"
+  local min="$3"
+  local raw
+  raw="$(cfg_get "$key" "$def")"
+
+  if [[ ! "$raw" =~ ^[0-9]+$ ]]; then
+    warn "Invalid integer for $key='$raw'; using default '$def'"
+    printf '%s' "$def"
+    return 0
+  fi
+
+  if (( raw < min )); then
+    warn "Out-of-range value for $key='$raw' (min=$min); using default '$def'"
+    printf '%s' "$def"
+    return 0
+  fi
+
+  printf '%s' "$raw"
+}
+
 # Expand {tokens} in values
 expand_tokens() {
   local s="$1"
@@ -517,30 +560,30 @@ ELITE_LAUNCH_MODE="$(cfg_get 'elite.launch_mode' 'auto')"   # auto|steam|mined
 TERMINAL_MODE="$(cfg_get 'elite.terminal_mode' 'auto')"     # auto|mined|steam_applaunch|command
 ELITE_PROFILE="$(cfg_get 'elite.profile' 'default')"
 ELITE_MINED_FLAGS="$(cfg_get 'elite.mined_flags' '/autorun /autoquit /edo')"
-ELITE_MONITOR_GAME="$(cfg_get 'elite.monitor_game' 'true')"
-HOTAS_FIX_ENABLED="$(cfg_get 'elite.hotas_fix_enabled' 'false')"
+ELITE_MONITOR_GAME="$(cfg_bool 'elite.monitor_game' 'true')"
+HOTAS_FIX_ENABLED="$(cfg_bool 'elite.hotas_fix_enabled' 'false')"
 
 # ----------------------------
 # EDCoPilot config
 # ----------------------------
-EDCOPILOT_ENABLED="$(cfg_get 'edcopilot.enabled' 'true')"
+EDCOPILOT_ENABLED="$(cfg_bool 'edcopilot.enabled' 'true')"
 EDCOPILOT_MODE="$(cfg_get 'edcopilot.mode' 'auto')"         # auto|runtime|wine
-EDCOPILOT_DELAY="$(cfg_get 'edcopilot.delay' '30')"
-EDCOPILOT_BUS_WAIT="$(cfg_get 'edcopilot.bus_wait' '30')"
-EDCOPILOT_INIT_TIMEOUT="$(cfg_get 'edcopilot.init_timeout' '45')"
-EDCOPILOT_RETRIES="$(cfg_get 'edcopilot.retries' '3')"
-EDCOPILOT_RETRY_SLEEP="$(cfg_get 'edcopilot.retry_sleep' '3')"
-EDCOPILOT_FORCE_LINUX_FLAG="$(cfg_get 'edcopilot.force_linux_flag' 'true')"
-EDCOPILOT_STANDALONE="$(cfg_get 'edcopilot.standalone' 'true')"
+EDCOPILOT_DELAY="$(cfg_int 'edcopilot.delay' '30' '0')"
+EDCOPILOT_BUS_WAIT="$(cfg_int 'edcopilot.bus_wait' '30' '0')"
+EDCOPILOT_INIT_TIMEOUT="$(cfg_int 'edcopilot.init_timeout' '45' '1')"
+EDCOPILOT_RETRIES="$(cfg_int 'edcopilot.retries' '3' '1')"
+EDCOPILOT_RETRY_SLEEP="$(cfg_int 'edcopilot.retry_sleep' '3' '0')"
+EDCOPILOT_FORCE_LINUX_FLAG="$(cfg_bool 'edcopilot.force_linux_flag' 'true')"
+EDCOPILOT_STANDALONE="$(cfg_bool 'edcopilot.standalone' 'true')"
 EDCOPILOT_EXE_ABS="$(cfg_get 'edcopilot.exe' '')"
 EDCOPILOT_EXE_REL="$(cfg_get 'edcopilot.exe_rel' 'drive_c/EDCoPilot/LaunchEDCoPilot.exe')"
 
 # EDCoPTER config (optional)
-EDCOPTER_ENABLED="$(cfg_get 'edcopter.enabled' 'false')"
+EDCOPTER_ENABLED="$(cfg_bool 'edcopter.enabled' 'false')"
 EDCOPTER_MODE="$(cfg_get 'edcopter.mode' 'auto')"
 EDCOPTER_EXE_ABS="$(cfg_get 'edcopter.exe' '')"
 EDCOPTER_EXE_REL="$(cfg_get 'edcopter.exe_rel' '')"
-EDCOPTER_HEADLESS="$(cfg_get 'edcopter.headless' 'false')"
+EDCOPTER_HEADLESS="$(cfg_bool 'edcopter.headless' 'false')"
 EDCOPTER_LISTEN_IP="$(cfg_get 'edcopter.listen_ip' '')"
 EDCOPTER_LISTEN_PORT="$(cfg_get 'edcopter.listen_port' '')"
 EDCOPTER_EDCOPILOT_IP="$(cfg_get 'edcopter.edcopilot_ip' '')"
