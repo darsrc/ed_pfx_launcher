@@ -282,9 +282,33 @@ vdf_library_paths_for_appid() {
   ' "$vdf" | sort -u
 }
 
+find_installdir_from_manifest() {
+  local manifest="$1"
+  [[ -f "$manifest" ]] || return 1
+
+  awk -F'"' '/"installdir"/ { print $4; exit }' "$manifest"
+}
+
 # Try to locate Elite install dir and MinEdLauncher.exe
 find_mined_exe() {
   local appid="$1" steam_root="$2" library_vdf="$3"
+
+  local -a candidate_roots=()
+  candidate_roots+=("$steam_root")
+
+  local lp
+  while IFS= read -r lp; do
+    [[ -n "$lp" ]] && candidate_roots+=("$lp")
+  done < <(vdf_library_paths_for_appid "$library_vdf" "$appid")
+
+  local root manifest installdir
+  for root in "${candidate_roots[@]}"; do
+    manifest="$root/steamapps/appmanifest_${appid}.acf"
+    installdir="$(find_installdir_from_manifest "$manifest" || true)"
+    if [[ -n "$installdir" && -f "$root/steamapps/common/$installdir/MinEdLauncher.exe" ]]; then
+      printf '%s' "$root/steamapps/common/$installdir/MinEdLauncher.exe"; return 0
+    fi
+  done
 
   # Most common
   if [[ -f "$steam_root/steamapps/common/Elite Dangerous/MinEdLauncher.exe" ]]; then
@@ -292,7 +316,6 @@ find_mined_exe() {
   fi
 
   # Check libraries
-  local lp
   while IFS= read -r lp; do
     [[ -z "$lp" ]] && continue
     if [[ -f "$lp/steamapps/common/Elite Dangerous/MinEdLauncher.exe" ]]; then
@@ -301,6 +324,45 @@ find_mined_exe() {
   done < <(vdf_library_paths_for_appid "$library_vdf" "$appid")
 
   return 1
+}
+
+resolve_edcopilot_exe() {
+  local explicit_abs="$1"
+  local explicit_rel="$2"
+
+  if [[ -n "$explicit_abs" ]]; then
+    expand_tokens "$explicit_abs" "$APPID" "$STEAM_ROOT" "$COMPATDATA_DIR" "$WINEPREFIX"
+    return 0
+  fi
+
+  if [[ -n "$explicit_rel" ]]; then
+    local rel_candidate="$WINEPREFIX/$explicit_rel"
+    if [[ -f "$rel_candidate" ]]; then
+      printf '%s' "$rel_candidate"
+      return 0
+    fi
+  fi
+
+  local -a candidates=(
+    "$WINEPREFIX/drive_c/EDCoPilot/LaunchEDCoPilot.exe"
+    "$WINEPREFIX/drive_c/Program Files/EDCoPilot/LaunchEDCoPilot.exe"
+    "$WINEPREFIX/drive_c/Program Files (x86)/EDCoPilot/LaunchEDCoPilot.exe"
+  )
+
+  local c
+  for c in "${candidates[@]}"; do
+    if [[ -f "$c" ]]; then
+      printf '%s' "$c"
+      return 0
+    fi
+  done
+
+  # Return the configured relative path even if missing so logs remain explicit.
+  if [[ -n "$explicit_rel" ]]; then
+    printf '%s' "$WINEPREFIX/$explicit_rel"
+  else
+    printf '%s' "$WINEPREFIX/drive_c/EDCoPilot/LaunchEDCoPilot.exe"
+  fi
 }
 
 # Find Proton path from compatdata/config_info if possible
@@ -485,12 +547,7 @@ EDCOPTER_EDCOPILOT_IP="$(cfg_get 'edcopter.edcopilot_ip' '')"
 EDCOPTER_ARGS_EXTRA="$(cfg_get 'edcopter.args_extra' '')"
 
 # Expand tokens for exe paths
-EDCOPILOT_EXE=""
-if [[ -n "$EDCOPILOT_EXE_ABS" ]]; then
-  EDCOPILOT_EXE="$(expand_tokens "$EDCOPILOT_EXE_ABS" "$APPID" "$STEAM_ROOT" "$COMPATDATA_DIR" "$WINEPREFIX")"
-else
-  EDCOPILOT_EXE="$WINEPREFIX/$EDCOPILOT_EXE_REL"
-fi
+EDCOPILOT_EXE="$(resolve_edcopilot_exe "$EDCOPILOT_EXE_ABS" "$EDCOPILOT_EXE_REL")"
 
 EDCOPTER_EXE=""
 if [[ -n "$EDCOPTER_EXE_ABS" ]]; then
@@ -659,6 +716,25 @@ wait_for_process() {
     sleep 1
     i=$((i+1))
   done
+  return 1
+}
+
+wait_for_process_any() {
+  local timeout="$1"
+  shift
+
+  local i=0
+  while (( i < timeout )); do
+    local pattern
+    for pattern in "$@"; do
+      if pgrep -f "$pattern" >/dev/null 2>&1; then
+        return 0
+      fi
+    done
+    sleep 1
+    i=$((i+1))
+  done
+
   return 1
 }
 
@@ -903,8 +979,8 @@ watcher_main() {
               start_tool_wine_detached "$EDCOPILOT_EXE" "edcopilot";;
           esac
 
-          # Wait for GUI
-          if wait_for_process 'EDCoPilotGUI2\.exe' "$EDCOPILOT_INIT_TIMEOUT"; then
+          # Wait for GUI (different versions can use different exe names)
+          if wait_for_process_any "$EDCOPILOT_INIT_TIMEOUT" 'EDCoPilotGUI2\.exe' 'EDCoPilotGUI\.exe' 'LaunchEDCoPilot\.exe'; then
             wlog "EDCoPilot GUI detected."
             launched=1
             break
