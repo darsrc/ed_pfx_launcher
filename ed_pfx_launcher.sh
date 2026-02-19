@@ -808,6 +808,7 @@ resolve_tool_path() {
 #   GAME_CMD_ARR  = array of argv to exec
 
 GAME_CMD_KIND=""
+GAME_WORKDIR=""
 declare -a GAME_CMD_ARR=()
 
 split_words_to_array() {
@@ -850,6 +851,7 @@ build_game_command() {
   if [[ "$mode" == "mined" || "$mode" == "auto" ]]; then
     if [[ -n "$mined_exe" && -f "$mined_exe" ]]; then
       GAME_CMD_KIND="mined"
+      GAME_WORKDIR="$(dirname "$mined_exe")"
       GAME_CMD_ARR=( "$PROTON_BIN" run "$mined_exe" "${mined_args[@]}" )
       return 0
     fi
@@ -858,6 +860,7 @@ build_game_command() {
   if [[ "$mode" == "steam" || "$mode" == "auto" ]]; then
     if (( have_forwarded == 1 )); then
       GAME_CMD_KIND="steam"
+      GAME_WORKDIR=""
       GAME_CMD_ARR=( "${FORWARDED_CMD[@]}" )
       return 0
     fi
@@ -873,6 +876,7 @@ build_game_command() {
   if [[ "$tmode" == "steam_applaunch" ]]; then
     if have steam; then
       GAME_CMD_KIND="steam_applaunch"
+      GAME_WORKDIR=""
       GAME_CMD_ARR=( steam -applaunch "$APPID" )
       return 0
     fi
@@ -1132,6 +1136,7 @@ fi
 build_game_command "$ELITE_LAUNCH_MODE"
 
 log "Game launch kind=$GAME_CMD_KIND"
+log "Game workdir=${GAME_WORKDIR:-<none>}"
 log "Game command: $(print_cmd "${GAME_CMD_ARR[@]}")"
 
 # Spawn watcher detached before exec
@@ -1144,6 +1149,11 @@ if have setsid; then
   setsid "$0" --config "$CONFIG_PATH" --watcher "$$" "$GAME_CMD_KIND" >>"$WATCHER_LOG" 2>&1 < /dev/null &
 else
   "$0" --config "$CONFIG_PATH" --watcher "$$" "$GAME_CMD_KIND" >>"$WATCHER_LOG" 2>&1 < /dev/null &
+fi
+
+# If launching MinEd, run from MinEd's directory for reliable autorun/profile behavior.
+if [[ -n "$GAME_WORKDIR" && -d "$GAME_WORKDIR" ]]; then
+  cd "$GAME_WORKDIR"
 fi
 
 # Exec into game so Steam tracks this PID as the game
