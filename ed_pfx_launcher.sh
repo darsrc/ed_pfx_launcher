@@ -906,7 +906,7 @@ build_game_command() {
   # Profile routing is optional; do not force it unless explicitly configured.
   # Keep product flags (/edo, etc.) authoritative to avoid interactive prompts.
   if [[ -n "$ELITE_PROFILE" ]] && ! array_contains "/frontier" "${mined_flags[@]}"; then
-    mined_args=( "/frontier" "$ELITE_PROFILE" "${mined_args[@]}" )
+    mined_args=( "${mined_args[@]}" "/frontier" "$ELITE_PROFILE" )
   fi
 
   if [[ "$mode" == "mined" || "$mode" == "auto" ]]; then
