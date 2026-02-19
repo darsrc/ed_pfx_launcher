@@ -255,6 +255,87 @@ log_edcopilot_tail() {
   fi
 }
 
+prepare_edcopilot_config() {
+  local force_linux_flag="$1"
+  local edcopilot_dir target
+
+  if [[ "$force_linux_flag" != "true" ]]; then
+    log "EDCoPilot RunningOnLinux patch disabled by config"
+    return 0
+  fi
+
+  edcopilot_dir="$(dirname "$EDCOPILOT_EXE")"
+  if [[ ! -d "$edcopilot_dir" ]]; then
+    warn "EDCoPilot directory not found, skipping RunningOnLinux patch: $edcopilot_dir"
+    return 0
+  fi
+
+  for target in "EDCoPilot.ini" "edcopilotgui.ini"; do
+    local target_path="$edcopilot_dir/$target"
+    if [[ ! -f "$target_path" ]]; then
+      log "Skipping missing EDCoPilot config: $target_path"
+      continue
+    fi
+
+    if result="$(python3 - "$target_path" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+file_path = Path(sys.argv[1])
+raw = file_path.read_bytes()
+
+def default_eol(data: bytes) -> bytes:
+    if b"\r\n" in data:
+        return b"\r\n"
+    if b"\n" in data:
+        return b"\n"
+    if b"\r" in data:
+        return b"\r"
+    return b"\n"
+
+line_ending = default_eol(raw)
+
+lines = raw.splitlines(keepends=True)
+updated = False
+found = False
+
+for idx, line in enumerate(lines):
+    text = line.decode("utf-8", errors="surrogateescape")
+    if re.match(r"^\s*RunningOnLinux\s*=", text, flags=re.IGNORECASE):
+        found = True
+        if line.endswith(b"\r\n"):
+            eol = b"\r\n"
+        elif line.endswith(b"\n"):
+            eol = b"\n"
+        elif line.endswith(b"\r"):
+            eol = b"\r"
+        else:
+            eol = line_ending
+        new_line = b'RunningOnLinux="1"' + eol
+        if line != new_line:
+            lines[idx] = new_line
+            updated = True
+
+if not found:
+    if lines and not lines[-1].endswith((b"\r\n", b"\n", b"\r")):
+        lines[-1] = lines[-1] + line_ending
+    lines.append(b'RunningOnLinux="1"' + line_ending)
+    updated = True
+
+if updated:
+    file_path.write_bytes(b"".join(lines))
+
+print("patched" if updated else "unchanged")
+PY
+)"; then
+      log "Prepared EDCoPilot config ($result): $target_path"
+    else
+      warn "Failed to patch EDCoPilot config: $target_path"
+    fi
+  done
+}
+
 launch_edcopilot_runtime() {
   local runtime_client="$1"
   local log_file="$LOG_DIR/edcopilot.log"
@@ -360,6 +441,7 @@ EDCOPILOT_MODE="$(cfg_get 'edcopilot.mode' 'auto')"
 EDCOPILOT_DELAY="$(cfg_int 'edcopilot.delay' '30' '0')"
 EDCOPILOT_INIT_TIMEOUT="$(cfg_int 'edcopilot.init_timeout' '45' '1')"
 EDCOPILOT_ALLOW_PROTON_FALLBACK="$(cfg_bool 'edcopilot.allow_proton_fallback' 'false')"
+EDCOPILOT_FORCE_LINUX_FLAG="$(cfg_bool 'edcopilot.force_linux_flag' 'true')"
 LAUNCHER_DETECT_TIMEOUT="$(cfg_int 'elite.launcher_detect_timeout' '120' '1')"
 GAME_DETECT_TIMEOUT="$(cfg_int 'elite.game_detect_timeout' '120' '1')"
 EDCOPILOT_EXE_REL="$(cfg_get 'edcopilot.exe_rel' 'drive_c/EDCoPilot/LaunchEDCoPilot.exe')"
@@ -382,6 +464,7 @@ PROTON_BIN="$(cfg_get 'proton.proton' '')"
 WINELOADER="$(dirname "$PROTON_BIN")/files/bin/wine"
 EDCOPILOT_EXE="$(cfg_get 'edcopilot.exe' '')"
 [[ -z "$EDCOPILOT_EXE" ]] && EDCOPILOT_EXE="$WINEPREFIX/$EDCOPILOT_EXE_REL"
+prepare_edcopilot_config "$EDCOPILOT_FORCE_LINUX_FLAG"
 EDCOPTER_EXE=""
 [[ -n "$EDCOPTER_EXE_REL" ]] && EDCOPTER_EXE="$WINEPREFIX/$EDCOPTER_EXE_REL"
 export WINEPREFIX STEAM_COMPAT_DATA_PATH="$COMPATDATA_DIR" STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT" SteamGameId="$APPID" WINEDEBUG="-all"
