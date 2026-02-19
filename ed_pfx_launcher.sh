@@ -235,6 +235,97 @@ cleanup_children() {
   for pid in "${CHILD_PIDS[@]:-}"; do kill -KILL "$pid" >/dev/null 2>&1 || true; done
 }
 
+collect_pids_for_patterns() {
+  local -a patterns=("$@")
+  local pattern pid
+  local -A uniq=()
+
+  for pattern in "${patterns[@]}"; do
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] && uniq["$pid"]=1
+    done < <(pgrep -f "$pattern" 2>/dev/null || true)
+  done
+
+  for pid in "${!uniq[@]}"; do
+    printf '%s\n' "$pid"
+  done
+}
+
+wait_for_patterns_to_exit() {
+  local timeout="$1"; shift
+  local elapsed=0
+
+  while (( elapsed < timeout )); do
+    if ! collect_pids_for_patterns "$@" | grep -q .; then
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  ! collect_pids_for_patterns "$@" | grep -q .
+}
+
+signal_patterns() {
+  local signal="$1"; shift
+  local pid
+
+  while IFS= read -r pid; do
+    kill "-$signal" "$pid" >/dev/null 2>&1 || true
+  done < <(collect_pids_for_patterns "$@")
+}
+
+shutdown_edcopilot() {
+  local edcopilot_dir request_file gui_exe
+  local -a patterns=('EDCoPilotGUI2\.exe' 'LaunchEDCoPilot\.exe' 'EDCoPilot\.exe')
+
+  edcopilot_dir="$(dirname "$EDCOPILOT_EXE")"
+  gui_exe="$edcopilot_dir/EDCoPilotGUI2.exe"
+  request_file="$edcopilot_dir/EDCoPilot.request.txt"
+
+  if [[ ! -f "$gui_exe" ]]; then
+    log "EDCoPilotGUI2.exe not found; skipping EDCoPilot native shutdown signaling"
+    return 0
+  fi
+
+  if collect_pids_for_patterns "${patterns[@]}" | grep -q .; then
+    printf 'Shutdown\n' > "$request_file"
+    log "Wrote EDCoPilot shutdown request: $request_file"
+  else
+    log "No EDCoPilot process found at shutdown; skipping request signaling"
+  fi
+
+  if wait_for_patterns_to_exit "$EDCOPILOT_SHUTDOWN_TIMEOUT" "${patterns[@]}"; then
+    log "EDCoPilot processes exited after native shutdown signaling"
+  else
+    warn "EDCoPilot still running after ${EDCOPILOT_SHUTDOWN_TIMEOUT}s; sending SIGTERM"
+    signal_patterns TERM "${patterns[@]}"
+    if ! wait_for_patterns_to_exit "$EDCOPILOT_FORCE_KILL_TIMEOUT" "${patterns[@]}"; then
+      warn "EDCoPilot still running after SIGTERM grace; sending SIGKILL"
+      signal_patterns KILL "${patterns[@]}"
+      wait_for_patterns_to_exit 2 "${patterns[@]}" || true
+    fi
+  fi
+
+  rm -f "$request_file"
+  log "Removed EDCoPilot shutdown request file (if present): $request_file"
+}
+
+shutdown_edcopter() {
+  local -a patterns=('EDCoPTER\.exe')
+
+  if ! collect_pids_for_patterns "${patterns[@]}" | grep -q .; then
+    return 0
+  fi
+
+  log "Stopping EDCoPTER processes"
+  signal_patterns TERM "${patterns[@]}"
+  if ! wait_for_patterns_to_exit "$EDCOPTER_SHUTDOWN_TIMEOUT" "${patterns[@]}"; then
+    warn "EDCoPTER still running after ${EDCOPTER_SHUTDOWN_TIMEOUT}s; sending SIGKILL"
+    signal_patterns KILL "${patterns[@]}"
+  fi
+}
+
 launch_wine_child() {
   local label="$1"; shift
   local log_file="$LOG_DIR/${label}.log"
@@ -440,13 +531,18 @@ EDCOPILOT_ENABLED="$(cfg_bool 'edcopilot.enabled' 'true')"
 EDCOPILOT_MODE="$(cfg_get 'edcopilot.mode' 'auto')"
 EDCOPILOT_DELAY="$(cfg_int 'edcopilot.delay' '30' '0')"
 EDCOPILOT_INIT_TIMEOUT="$(cfg_int 'edcopilot.init_timeout' '45' '1')"
+EDCOPILOT_SHUTDOWN_TIMEOUT="$(cfg_int 'edcopilot.shutdown_timeout' '15' '1')"
+EDCOPILOT_FORCE_KILL_TIMEOUT="$(cfg_int 'edcopilot.force_kill_timeout' '5' '1')"
 EDCOPILOT_ALLOW_PROTON_FALLBACK="$(cfg_bool 'edcopilot.allow_proton_fallback' 'false')"
 EDCOPILOT_FORCE_LINUX_FLAG="$(cfg_bool 'edcopilot.force_linux_flag' 'true')"
 LAUNCHER_DETECT_TIMEOUT="$(cfg_int 'elite.launcher_detect_timeout' '120' '1')"
 GAME_DETECT_TIMEOUT="$(cfg_int 'elite.game_detect_timeout' '120' '1')"
 EDCOPILOT_EXE_REL="$(cfg_get 'edcopilot.exe_rel' 'drive_c/EDCoPilot/LaunchEDCoPilot.exe')"
 EDCOPTER_ENABLED="$(cfg_bool 'edcopter.enabled' 'false')"
+EDCOPTER_SHUTDOWN_TIMEOUT="$(cfg_int 'edcopter.shutdown_timeout' '5' '1')"
 EDCOPTER_EXE_REL="$(cfg_get 'edcopter.exe_rel' '')"
+WINESERVER_KILL_ON_SHUTDOWN="$(cfg_bool 'wine.wineserver_kill_on_shutdown' 'false')"
+WINESERVER_WAIT_ON_SHUTDOWN="$(cfg_bool 'wine.wineserver_wait_on_shutdown' 'false')"
 phase_end "bootstrap"
 
 phase_start "detect steam/prefix/runtime"
@@ -591,9 +687,22 @@ while true; do
       ;;
     STATE_SHUTDOWN)
       phase_start "STATE_SHUTDOWN"
+      if [[ "$EDCOPILOT_ENABLED" == "true" && -f "$EDCOPILOT_EXE" ]]; then
+        shutdown_edcopilot
+      fi
+      if [[ "$EDCOPTER_ENABLED" == "true" && -n "$EDCOPTER_EXE" && -f "$EDCOPTER_EXE" ]]; then
+        shutdown_edcopter
+      fi
       cleanup_children
       if [[ -x "$(dirname "$PROTON_BIN")/files/bin/wineserver" ]]; then
-        "$(dirname "$PROTON_BIN")/files/bin/wineserver" -k >/dev/null 2>&1 || true
+        if [[ "$WINESERVER_KILL_ON_SHUTDOWN" == "true" ]]; then
+          "$(dirname "$PROTON_BIN")/files/bin/wineserver" -k >/dev/null 2>&1 || true
+          log "Ran wineserver -k"
+        fi
+        if [[ "$WINESERVER_WAIT_ON_SHUTDOWN" == "true" ]]; then
+          "$(dirname "$PROTON_BIN")/files/bin/wineserver" -w >/dev/null 2>&1 || true
+          log "Ran wineserver -w"
+        fi
       fi
       phase_end "STATE_SHUTDOWN"
       break
