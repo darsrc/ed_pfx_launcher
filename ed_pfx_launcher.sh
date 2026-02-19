@@ -115,6 +115,28 @@ detect_runtime_client() {
   return 1
 }
 
+resolve_runtime_client_from_processes() {
+  local process_line candidate
+
+  process_line="$(pgrep -fa 'SteamLinuxRuntime_.*/pressure-vessel.*/EliteDangerous64\.exe' 2>/dev/null | head -n1 || true)"
+  [[ -z "$process_line" ]] && process_line="$(pgrep -fa 'SteamLinuxRuntime_.*pressure-vessel.*/EDLaunch\.exe' 2>/dev/null | head -n1 || true)"
+  [[ -z "$process_line" ]] && return 1
+
+  candidate="$(printf '%s\n' "$process_line" | sed -n 's#.*\(/[^[:space:]]*SteamLinuxRuntime_[^[:space:]]*/pressure-vessel\).*#\1/bin/steam-runtime-launch-client#p')"
+  [[ -z "$candidate" ]] && return 1
+
+  if [[ ! -e "$candidate" ]]; then
+    warn "Resolved runtime client candidate does not exist: $candidate"
+    return 1
+  fi
+  if [[ ! -x "$candidate" ]]; then
+    warn "Resolved runtime client candidate is not executable: $candidate"
+    return 1
+  fi
+
+  printf '%s' "$candidate"
+}
+
 find_proton() {
   local steam_root="$1" p
   p="$(ls -1d "$steam_root"/steamapps/common/Proton*/proton 2>/dev/null | head -n1 || true)"
@@ -166,7 +188,16 @@ launch_wine_child() {
 }
 
 launch_edcopilot() {
-  local mode="$1"
+  local mode="$1" runtime_client=""
+
+  runtime_client="$(resolve_runtime_client_from_processes || true)"
+  if [[ -n "$runtime_client" ]]; then
+    RUNTIME_CLIENT="$runtime_client"
+    log "Resolved runtime client from running process: $RUNTIME_CLIENT"
+  elif [[ -n "${RUNTIME_CLIENT:-}" && -x "$RUNTIME_CLIENT" ]]; then
+    log "Falling back to static runtime client: $RUNTIME_CLIENT"
+  fi
+
   if [[ "$mode" == "runtime" || ( "$mode" == "auto" && -n "$RUNTIME_CLIENT" ) ]]; then
     if [[ -x "${RUNTIME_CLIENT:-}" ]]; then
       launch_wine_child "edcopilot" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- "$WINELOADER" "$EDCOPILOT_EXE"
@@ -303,7 +334,19 @@ while true; do
     STATE_LAUNCH_AUX)
       phase_start "STATE_LAUNCH_AUX"
       if [[ "$EDCOPTER_ENABLED" == "true" && -n "$EDCOPTER_EXE" && -f "$EDCOPTER_EXE" ]]; then
-        launch_wine_child "edcopter" "$PROTON_BIN" run "$EDCOPTER_EXE"
+        runtime_client="$(resolve_runtime_client_from_processes || true)"
+        if [[ -n "$runtime_client" ]]; then
+          RUNTIME_CLIENT="$runtime_client"
+          log "Resolved runtime client from running process: $RUNTIME_CLIENT"
+        elif [[ -n "${RUNTIME_CLIENT:-}" && -x "$RUNTIME_CLIENT" ]]; then
+          log "Falling back to static runtime client: $RUNTIME_CLIENT"
+        fi
+
+        if [[ -x "${RUNTIME_CLIENT:-}" ]]; then
+          launch_wine_child "edcopter" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- "$WINELOADER" "$EDCOPTER_EXE"
+        else
+          launch_wine_child "edcopter" "$PROTON_BIN" run "$EDCOPTER_EXE"
+        fi
       fi
       for t in "${CLI_TOOLS[@]}"; do
         [[ -f "$t" ]] || { warn "tool not found: $t"; continue; }
