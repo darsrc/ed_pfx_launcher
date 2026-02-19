@@ -156,6 +156,62 @@ wait_for_process_any() {
   return 1
 }
 
+first_pid_for_pattern() {
+  local pattern="$1"
+  pgrep -f "$pattern" 2>/dev/null | head -n1 || true
+}
+
+wait_for_game_window() {
+  local timeout="$1"
+  local elapsed=0
+  local game_pid=""
+
+  while (( elapsed < timeout )); do
+    game_pid="$(first_pid_for_pattern 'EliteDangerous64\.exe')"
+    if [[ -n "$game_pid" ]]; then
+      DETECTED_KIND="mined"
+      DETECTED_PID="$game_pid"
+      log "Detected game process (EliteDangerous64.exe) pid=$DETECTED_PID"
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  return 1
+}
+
+wait_for_launcher() {
+  local timeout="$1"
+  local elapsed=0
+  local mined_pid=""
+  local edlaunch_pid=""
+
+  while (( elapsed < timeout )); do
+    mined_pid="$(first_pid_for_pattern 'MinEdLauncher')"
+    if [[ -n "$mined_pid" ]]; then
+      log "Detected MinEdLauncher pid=$mined_pid; waiting for EliteDangerous64.exe"
+      if wait_for_game_window "$GAME_DETECT_TIMEOUT"; then
+        return 0
+      fi
+      return 1
+    fi
+
+    edlaunch_pid="$(first_pid_for_pattern '[ZX]:.*steamapps.common.Elite Dangerous.EDLaunch\.exe.*')"
+    if [[ -n "$edlaunch_pid" ]]; then
+      DETECTED_KIND="edlaunch"
+      DETECTED_PID="$edlaunch_pid"
+      log "Detected EDLaunch process pid=$DETECTED_PID"
+      return 0
+    fi
+
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  return 1
+}
+
 is_elite_running() { pgrep -f 'EliteDangerous64\.exe|EDLaunch\.exe' >/dev/null 2>&1; }
 
 # state enum via functions
@@ -240,6 +296,8 @@ EDCOPILOT_ENABLED="$(cfg_bool 'edcopilot.enabled' 'true')"
 EDCOPILOT_MODE="$(cfg_get 'edcopilot.mode' 'auto')"
 EDCOPILOT_DELAY="$(cfg_int 'edcopilot.delay' '30' '0')"
 EDCOPILOT_INIT_TIMEOUT="$(cfg_int 'edcopilot.init_timeout' '45' '1')"
+LAUNCHER_DETECT_TIMEOUT="$(cfg_int 'elite.launcher_detect_timeout' '120' '1')"
+GAME_DETECT_TIMEOUT="$(cfg_int 'elite.game_detect_timeout' '120' '1')"
 EDCOPILOT_EXE_REL="$(cfg_get 'edcopilot.exe_rel' 'drive_c/EDCoPilot/LaunchEDCoPilot.exe')"
 EDCOPTER_ENABLED="$(cfg_bool 'edcopter.enabled' 'false')"
 EDCOPTER_EXE_REL="$(cfg_get 'edcopter.exe_rel' '')"
@@ -276,6 +334,9 @@ fi
 phase_end "detect launcher/game"
 
 GAME_PID=""
+DETECTED_KIND=""
+DETECTED_PID=""
+MONITOR_PID=""
 
 while true; do
   case "$CURRENT_STATE" in
@@ -300,9 +361,21 @@ while true; do
       if [[ "$NO_GAME" -eq 1 ]] || [[ "$DRY_RUN" -eq 1 ]]; then
         log "Skipping wait for game in no-game/dry-run"
       else
-        local_wait=0
-        until is_elite_running || (( local_wait >= 120 )); do sleep 2; local_wait=$((local_wait+2)); done
-        is_elite_running && log "Elite process detected" || warn "Elite process not detected within timeout; continuing"
+        if ! wait_for_launcher "$LAUNCHER_DETECT_TIMEOUT"; then
+          phase_fail "STATE_WAIT_GAME" "launcher/game detection timeout"
+          die "Launcher detection timed out after ${LAUNCHER_DETECT_TIMEOUT}s or game detection timed out after ${GAME_DETECT_TIMEOUT}s"
+        fi
+
+        if [[ "$DETECTED_KIND" == "mined" ]]; then
+          MONITOR_PID="$DETECTED_PID"
+          log "Monitor lifecycle token=game pid=$MONITOR_PID"
+        elif [[ "$DETECTED_KIND" == "edlaunch" ]]; then
+          MONITOR_PID="$DETECTED_PID"
+          log "Monitor lifecycle token=launcher pid=$MONITOR_PID"
+        else
+          phase_fail "STATE_WAIT_GAME" "unexpected detection kind"
+          die "Unexpected launcher detection result"
+        fi
       fi
       CURRENT_STATE="STATE_LAUNCH_EDCOPILOT"
       phase_end "STATE_WAIT_GAME"
@@ -363,8 +436,8 @@ while true; do
           while true; do sleep 5; done
         fi
       elif [[ "$DRY_RUN" -eq 0 ]]; then
-        if [[ -n "$GAME_PID" ]]; then
-          while kill -0 "$GAME_PID" >/dev/null 2>&1; do sleep 5; done
+        if [[ -n "$MONITOR_PID" ]]; then
+          while kill -0 "$MONITOR_PID" >/dev/null 2>&1; do sleep 5; done
         else
           while is_elite_running; do sleep 5; done
         fi
