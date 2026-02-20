@@ -626,6 +626,17 @@ build_game_command() {
     return 0
   fi
 
+  # Most reliable path: ask the native Steam client to launch the game so
+  # auth/session context is established by Steam before MinEdLauncher runs.
+  local steam_cmd
+  steam_cmd="$(cfg_get 'elite.steam_command' 'steam')"
+  if have "$steam_cmd"; then
+    GAME_CMD_KIND="steam-applaunch"
+    GAME_CMD_ARR=("$steam_cmd" -applaunch "$APPID")
+    return 0
+  fi
+  warn "Steam command '$steam_cmd' not found in PATH; falling back to direct MinEdLauncher launch"
+
   local mined_exe
   mined_exe="$(cfg_get 'elite.mined_exe' '')"
   [[ -z "$mined_exe" ]] && mined_exe="$STEAM_ROOT/steamapps/common/Elite Dangerous/MinEdLauncher.exe"
@@ -636,7 +647,7 @@ build_game_command() {
     return 0
   fi
 
-  die "Unable to build game command. Pass Steam %command% or set elite.mined_exe"
+  die "Unable to build game command. Pass Steam %command%, ensure elite.steam_command exists, or set elite.mined_exe"
 }
 
 ini_load "$CONFIG_PATH"
