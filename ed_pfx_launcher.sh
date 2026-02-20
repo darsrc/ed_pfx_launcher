@@ -229,7 +229,6 @@ resolve_runtime_client_from_processes() {
   local process_line candidate
 
   process_line="$(pgrep -fa 'SteamLinuxRuntime_.*/pressure-vessel.*/EliteDangerous64\.exe' 2>/dev/null | head -n1 || true)"
-  [[ -z "$process_line" ]] && process_line="$(pgrep -fa 'SteamLinuxRuntime_.*pressure-vessel.*/EDLaunch\.exe' 2>/dev/null | head -n1 || true)"
   [[ -z "$process_line" ]] && return 1
 
   candidate="$(printf '%s\n' "$process_line" | sed -n 's#.*\(/[^[:space:]]*SteamLinuxRuntime_[^[:space:]]*/pressure-vessel\).*#\1/bin/steam-runtime-launch-client#p')"
@@ -295,7 +294,6 @@ wait_for_launcher() {
   local timeout="$1"
   local elapsed=0
   local mined_pid=""
-  local edlaunch_pid=""
 
   while (( elapsed < timeout )); do
     mined_pid="$(first_pid_for_pattern 'MinEdLauncher')"
@@ -307,14 +305,6 @@ wait_for_launcher() {
       return 1
     fi
 
-    edlaunch_pid="$(first_pid_for_pattern '[ZX]:.*steamapps.common.Elite Dangerous.EDLaunch\.exe.*')"
-    if [[ -n "$edlaunch_pid" ]]; then
-      DETECTED_KIND="edlaunch"
-      DETECTED_PID="$edlaunch_pid"
-      log "Detected EDLaunch process pid=$DETECTED_PID"
-      return 0
-    fi
-
     sleep 1
     elapsed=$((elapsed + 1))
   done
@@ -322,7 +312,7 @@ wait_for_launcher() {
   return 1
 }
 
-is_elite_running() { pgrep -f 'EliteDangerous64\.exe|EDLaunch\.exe' >/dev/null 2>&1; }
+is_elite_running() { pgrep -f 'EliteDangerous64\.exe' >/dev/null 2>&1; }
 
 # state enum via functions
 STATE_WAIT_LAUNCHER() { :; }
@@ -621,14 +611,13 @@ build_game_command() {
   GAME_CMD_ARR=()
 
   if (( ${#FORWARDED_CMD[@]} > 0 )) && [[ "${FORWARDED_CMD[0]}" != "%command%" ]]; then
-    GAME_CMD_KIND="steam"
-    GAME_CMD_ARR=("${FORWARDED_CMD[@]}")
-    return 0
+    warn "Ignoring forwarded command to enforce MinEdLauncher-only policy"
   fi
 
   local mined_exe
   mined_exe="$(cfg_get 'elite.mined_exe' '')"
   [[ -z "$mined_exe" ]] && mined_exe="$STEAM_ROOT/steamapps/common/Elite Dangerous/MinEdLauncher.exe"
+
   if [[ -f "$mined_exe" ]]; then
     GAME_CMD_KIND="mined"
     GAME_WORKDIR="$(dirname "$mined_exe")"
@@ -636,7 +625,7 @@ build_game_command() {
     return 0
   fi
 
-  die "Unable to build game command. Pass Steam %command% or set elite.mined_exe"
+  die "MinEdLauncher-only mode is enabled, but MinEdLauncher.exe was not found. Set elite.mined_exe in config."
 }
 
 ini_load "$CONFIG_PATH"
@@ -736,19 +725,12 @@ while true; do
           die "Launcher detection timed out after ${LAUNCHER_DETECT_TIMEOUT}s or game detection timed out after ${GAME_DETECT_TIMEOUT}s"
         fi
 
-        if [[ "$SHUTDOWN_MONITOR_TARGET" == "launcher" && "$DETECTED_KIND" == "edlaunch" ]]; then
-          MONITOR_PID="$DETECTED_PID"
-          log "Monitor lifecycle token=launcher pid=$MONITOR_PID"
-        elif [[ "$SHUTDOWN_MONITOR_TARGET" == "launcher" ]]; then
-          warn "monitor_target=launcher requested but launcher process not detected; falling back to game"
-          MONITOR_PID="$DETECTED_PID"
-          log "Monitor lifecycle token=$DETECTED_KIND pid=$MONITOR_PID"
-        elif [[ "$DETECTED_KIND" == "mined" ]]; then
+        if [[ "$SHUTDOWN_MONITOR_TARGET" == "launcher" ]]; then
+          warn "monitor_target=launcher requested; MinEd mode monitors the game process"
+        fi
+        if [[ "$DETECTED_KIND" == "mined" ]]; then
           MONITOR_PID="$DETECTED_PID"
           log "Monitor lifecycle token=game pid=$MONITOR_PID"
-        elif [[ "$DETECTED_KIND" == "edlaunch" ]]; then
-          MONITOR_PID="$DETECTED_PID"
-          log "Monitor lifecycle token=launcher pid=$MONITOR_PID"
         else
           phase_fail "STATE_WAIT_GAME" "unexpected detection kind"
           die "Unexpected launcher detection result"
