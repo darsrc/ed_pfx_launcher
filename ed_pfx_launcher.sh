@@ -185,6 +185,7 @@ log_effective_config() {
   log "Effective startup configuration:"
   log "  detection.launcher_timeout=$LAUNCHER_DETECT_TIMEOUT source=$(cfg_source_or_unknown 'detection.launcher_timeout')"
   log "  detection.game_timeout=$GAME_DETECT_TIMEOUT source=$(cfg_source_or_unknown 'detection.game_timeout')"
+  log "  elite.launcher_preference=$LAUNCHER_PREFERENCE source=$(cfg_source_or_unknown 'elite.launcher_preference')"
   log "  edcopilot.enabled=$EDCOPILOT_ENABLED source=$(cfg_source_or_unknown 'edcopilot.enabled')"
   log "  edcopilot.exe=$EDCOPILOT_EXE source=$(cfg_source_or_unknown 'edcopilot.exe')"
   log "  edcopilot.mode=$EDCOPILOT_MODE source=$(cfg_source_or_unknown 'edcopilot.mode')"
@@ -303,6 +304,14 @@ wait_for_launcher() {
         return 0
       fi
       return 1
+    fi
+
+    edlaunch_pid="$(first_pid_for_pattern 'EDLaunch\.exe')"
+    if [[ -n "$edlaunch_pid" ]]; then
+      DETECTED_KIND="edlaunch"
+      DETECTED_PID="$edlaunch_pid"
+      log "Detected EDLaunch process pid=$DETECTED_PID"
+      return 0
     fi
 
     sleep 1
@@ -614,9 +623,64 @@ build_game_command() {
     warn "Ignoring forwarded command to enforce MinEdLauncher-only policy"
   fi
 
-  local mined_exe
+  local launcher_preference mined_exe edlaunch_exe
+  launcher_preference="${LAUNCHER_PREFERENCE:-edlaunch}"
+  launcher_preference="${launcher_preference,,}"
+
   mined_exe="$(cfg_get 'elite.mined_exe' '')"
   [[ -z "$mined_exe" ]] && mined_exe="$STEAM_ROOT/steamapps/common/Elite Dangerous/MinEdLauncher.exe"
+  edlaunch_exe="$(cfg_get 'elite.edlaunch_exe' '')"
+  [[ -z "$edlaunch_exe" ]] && edlaunch_exe="$STEAM_ROOT/steamapps/common/Elite Dangerous/EDLaunch.exe"
+
+  case "$launcher_preference" in
+    edlaunch)
+      if [[ -f "$edlaunch_exe" ]]; then
+        GAME_CMD_KIND="edlaunch"
+        GAME_WORKDIR="$(dirname "$edlaunch_exe")"
+        GAME_CMD_ARR=("$PROTON_BIN" run "$edlaunch_exe")
+        return 0
+      fi
+      die "elite.launcher_preference=edlaunch but EDLaunch.exe not found: $edlaunch_exe"
+      ;;
+    mined)
+      if [[ -f "$mined_exe" ]]; then
+        GAME_CMD_KIND="mined"
+        GAME_WORKDIR="$(dirname "$mined_exe")"
+        GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe")
+        return 0
+      fi
+      die "elite.launcher_preference=mined but MinEdLauncher.exe not found: $mined_exe"
+      ;;
+    auto)
+      if [[ -f "$edlaunch_exe" ]]; then
+        GAME_CMD_KIND="edlaunch"
+        GAME_WORKDIR="$(dirname "$edlaunch_exe")"
+        GAME_CMD_ARR=("$PROTON_BIN" run "$edlaunch_exe")
+        return 0
+      fi
+      if [[ -f "$mined_exe" ]]; then
+        GAME_CMD_KIND="mined"
+        GAME_WORKDIR="$(dirname "$mined_exe")"
+        GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe")
+        return 0
+      fi
+      ;;
+    *)
+      warn "Invalid elite.launcher_preference='$launcher_preference'; using auto"
+      if [[ -f "$edlaunch_exe" ]]; then
+        GAME_CMD_KIND="edlaunch"
+        GAME_WORKDIR="$(dirname "$edlaunch_exe")"
+        GAME_CMD_ARR=("$PROTON_BIN" run "$edlaunch_exe")
+        return 0
+      fi
+      if [[ -f "$mined_exe" ]]; then
+        GAME_CMD_KIND="mined"
+        GAME_WORKDIR="$(dirname "$mined_exe")"
+        GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe")
+        return 0
+      fi
+      ;;
+  esac
 
   if [[ -f "$mined_exe" ]]; then
     GAME_CMD_KIND="mined"
@@ -626,6 +690,7 @@ build_game_command() {
   fi
 
   die "MinEdLauncher-only mode is enabled, but MinEdLauncher.exe was not found. Set elite.mined_exe in config."
+  die "Unable to build game command. Pass Steam %command% or set elite.edlaunch_exe/elite.mined_exe"
 }
 
 ini_load "$CONFIG_PATH"
@@ -644,6 +709,7 @@ EDCOPILOT_ALLOW_PROTON_FALLBACK="$(cfg_bool 'edcopilot.allow_proton_fallback' 'f
 EDCOPILOT_FORCE_LINUX_FLAG="$(cfg_bool 'edcopilot.force_linux_flag' 'true')"
 cfg_assign_select_int LAUNCHER_DETECT_TIMEOUT 'detection.launcher_timeout' '120' '1' 'detection.launcher_timeout' 'elite.launcher_detect_timeout'
 cfg_assign_select_int GAME_DETECT_TIMEOUT 'detection.game_timeout' '120' '1' 'detection.game_timeout' 'elite.game_detect_timeout'
+cfg_assign_select LAUNCHER_PREFERENCE 'elite.launcher_preference' 'edlaunch' 'elite.launcher_preference'
 EDCOPILOT_EXE_REL="$(cfg_get 'edcopilot.exe_rel' 'drive_c/EDCoPilot/LaunchEDCoPilot.exe')"
 EDCOPTER_ENABLED="$(cfg_bool 'edcopter.enabled' 'false')"
 EDCOPTER_SHUTDOWN_TIMEOUT="$(cfg_int 'edcopter.shutdown_timeout' '5' '1')"
