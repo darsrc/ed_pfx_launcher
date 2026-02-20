@@ -131,19 +131,69 @@ cfg_select_int() {
   printf '%s' "$default"
 }
 
+cfg_assign_select() {
+  local out_var="$1" target="$2" default="$3"
+  shift 3
+  local key="" val="$default" source="default"
+
+  for key in "$@"; do
+    if cfg_has "$key"; then
+      val="$(cfg_get "$key")"
+      if [[ "$key" == "$target" ]]; then
+        source="config:$key"
+      else
+        source="compat:$key"
+        warn "Deprecated config key '$key' is in use; migrate to '$target'"
+      fi
+      break
+    fi
+  done
+
+  printf -v "$out_var" '%s' "$val"
+  CFG_SOURCE["$target"]="$source"
+}
+
+cfg_assign_select_bool() {
+  local out_var="$1" target="$2" default="$3"
+  shift 3
+  local raw
+  cfg_assign_select raw "$target" "$default" "$@"
+  case "${raw,,}" in
+    true|false) printf -v "$out_var" '%s' "${raw,,}" ;;
+    *) printf -v "$out_var" '%s' "$default" ;;
+  esac
+}
+
+cfg_assign_select_int() {
+  local out_var="$1" target="$2" default="$3" min="$4"
+  shift 4
+  local raw
+  cfg_assign_select raw "$target" "$default" "$@"
+  if [[ "$raw" =~ ^[0-9]+$ ]] && (( raw >= min )); then
+    printf -v "$out_var" '%s' "$raw"
+    return 0
+  fi
+  printf -v "$out_var" '%s' "$default"
+}
+
+cfg_source_or_unknown() {
+  local key="$1"
+  printf '%s' "${CFG_SOURCE[$key]:-unknown}"
+}
+
 log_effective_config() {
   log "Effective startup configuration:"
-  log "  detection.launcher_timeout=$LAUNCHER_DETECT_TIMEOUT source=${CFG_SOURCE[detection.launcher_timeout]}"
-  log "  detection.game_timeout=$GAME_DETECT_TIMEOUT source=${CFG_SOURCE[detection.game_timeout]}"
-  log "  edcopilot.enabled=$EDCOPILOT_ENABLED source=${CFG_SOURCE[edcopilot.enabled]}"
-  log "  edcopilot.exe=$EDCOPILOT_EXE source=${CFG_SOURCE[edcopilot.exe]}"
-  log "  edcopilot.mode=$EDCOPILOT_MODE source=${CFG_SOURCE[edcopilot.mode]}"
-  log "  edcopilot.startup_delay=$EDCOPILOT_DELAY source=${CFG_SOURCE[edcopilot.startup_delay]}"
-  log "  edcopilot.bus_wait=$EDCOPILOT_BUS_WAIT source=${CFG_SOURCE[edcopilot.bus_wait]}"
-  log "  edcopilot.init_timeout=$EDCOPILOT_INIT_TIMEOUT source=${CFG_SOURCE[edcopilot.init_timeout]}"
-  log "  edcopilot.graceful_shutdown_timeout=$EDCOPILOT_SHUTDOWN_TIMEOUT source=${CFG_SOURCE[edcopilot.graceful_shutdown_timeout]}"
-  log "  shutdown.monitor_target=$SHUTDOWN_MONITOR_TARGET source=${CFG_SOURCE[shutdown.monitor_target]}"
-  log "  shutdown.wineserver_cleanup=$WINESERVER_CLEANUP source=${CFG_SOURCE[shutdown.wineserver_cleanup]}"
+  log "  detection.launcher_timeout=$LAUNCHER_DETECT_TIMEOUT source=$(cfg_source_or_unknown 'detection.launcher_timeout')"
+  log "  detection.game_timeout=$GAME_DETECT_TIMEOUT source=$(cfg_source_or_unknown 'detection.game_timeout')"
+  log "  edcopilot.enabled=$EDCOPILOT_ENABLED source=$(cfg_source_or_unknown 'edcopilot.enabled')"
+  log "  edcopilot.exe=$EDCOPILOT_EXE source=$(cfg_source_or_unknown 'edcopilot.exe')"
+  log "  edcopilot.mode=$EDCOPILOT_MODE source=$(cfg_source_or_unknown 'edcopilot.mode')"
+  log "  edcopilot.startup_delay=$EDCOPILOT_DELAY source=$(cfg_source_or_unknown 'edcopilot.startup_delay')"
+  log "  edcopilot.bus_wait=$EDCOPILOT_BUS_WAIT source=$(cfg_source_or_unknown 'edcopilot.bus_wait')"
+  log "  edcopilot.init_timeout=$EDCOPILOT_INIT_TIMEOUT source=$(cfg_source_or_unknown 'edcopilot.init_timeout')"
+  log "  edcopilot.graceful_shutdown_timeout=$EDCOPILOT_SHUTDOWN_TIMEOUT source=$(cfg_source_or_unknown 'edcopilot.graceful_shutdown_timeout')"
+  log "  shutdown.monitor_target=$SHUTDOWN_MONITOR_TARGET source=$(cfg_source_or_unknown 'shutdown.monitor_target')"
+  log "  shutdown.wineserver_cleanup=$WINESERVER_CLEANUP source=$(cfg_source_or_unknown 'shutdown.wineserver_cleanup')"
 }
 
 expand_tokens() {
@@ -594,27 +644,27 @@ ini_load "$CONFIG_PATH"
 phase_start "bootstrap"
 APPID="$(cfg_get 'steam.appid' "${SteamGameId:-359320}")"
 BUS_NAME="com.steampowered.App$APPID"
-EDCOPILOT_ENABLED="$(cfg_select_bool 'edcopilot.enabled' 'true' 'edcopilot.enabled')"
-EDCOPILOT_MODE="$(cfg_select 'edcopilot.mode' 'runtime' 'edcopilot.mode')"
-EDCOPILOT_DELAY="$(cfg_select_int 'edcopilot.startup_delay' '30' '0' 'edcopilot.startup_delay' 'edcopilot.delay')"
-EDCOPILOT_BUS_WAIT="$(cfg_select_int 'edcopilot.bus_wait' '30' '0' 'edcopilot.bus_wait')"
-EDCOPILOT_INIT_TIMEOUT="$(cfg_select_int 'edcopilot.init_timeout' '45' '1' 'edcopilot.init_timeout')"
-EDCOPILOT_SHUTDOWN_TIMEOUT="$(cfg_select_int 'edcopilot.graceful_shutdown_timeout' '15' '1' 'edcopilot.graceful_shutdown_timeout' 'edcopilot.shutdown_timeout')"
+cfg_assign_select_bool EDCOPILOT_ENABLED 'edcopilot.enabled' 'true' 'edcopilot.enabled'
+cfg_assign_select EDCOPILOT_MODE 'edcopilot.mode' 'runtime' 'edcopilot.mode'
+cfg_assign_select_int EDCOPILOT_DELAY 'edcopilot.startup_delay' '30' '0' 'edcopilot.startup_delay' 'edcopilot.delay'
+cfg_assign_select_int EDCOPILOT_BUS_WAIT 'edcopilot.bus_wait' '30' '0' 'edcopilot.bus_wait'
+cfg_assign_select_int EDCOPILOT_INIT_TIMEOUT 'edcopilot.init_timeout' '45' '1' 'edcopilot.init_timeout'
+cfg_assign_select_int EDCOPILOT_SHUTDOWN_TIMEOUT 'edcopilot.graceful_shutdown_timeout' '15' '1' 'edcopilot.graceful_shutdown_timeout' 'edcopilot.shutdown_timeout'
 EDCOPILOT_FORCE_KILL_TIMEOUT="$(cfg_int 'edcopilot.force_kill_timeout' '5' '1')"
 EDCOPILOT_ALLOW_PROTON_FALLBACK="$(cfg_bool 'edcopilot.allow_proton_fallback' 'false')"
 EDCOPILOT_FORCE_LINUX_FLAG="$(cfg_bool 'edcopilot.force_linux_flag' 'true')"
-LAUNCHER_DETECT_TIMEOUT="$(cfg_select_int 'detection.launcher_timeout' '120' '1' 'detection.launcher_timeout' 'elite.launcher_detect_timeout')"
-GAME_DETECT_TIMEOUT="$(cfg_select_int 'detection.game_timeout' '120' '1' 'detection.game_timeout' 'elite.game_detect_timeout')"
+cfg_assign_select_int LAUNCHER_DETECT_TIMEOUT 'detection.launcher_timeout' '120' '1' 'detection.launcher_timeout' 'elite.launcher_detect_timeout'
+cfg_assign_select_int GAME_DETECT_TIMEOUT 'detection.game_timeout' '120' '1' 'detection.game_timeout' 'elite.game_detect_timeout'
 EDCOPILOT_EXE_REL="$(cfg_get 'edcopilot.exe_rel' 'drive_c/EDCoPilot/LaunchEDCoPilot.exe')"
 EDCOPTER_ENABLED="$(cfg_bool 'edcopter.enabled' 'false')"
 EDCOPTER_SHUTDOWN_TIMEOUT="$(cfg_int 'edcopter.shutdown_timeout' '5' '1')"
 EDCOPTER_EXE_REL="$(cfg_get 'edcopter.exe_rel' '')"
-SHUTDOWN_MONITOR_TARGET="$(cfg_select 'shutdown.monitor_target' 'game' 'shutdown.monitor_target')"
+cfg_assign_select SHUTDOWN_MONITOR_TARGET 'shutdown.monitor_target' 'game' 'shutdown.monitor_target'
 case "$SHUTDOWN_MONITOR_TARGET" in
   launcher|game) ;;
   *) warn "Invalid shutdown.monitor_target='$SHUTDOWN_MONITOR_TARGET'; defaulting to game"; SHUTDOWN_MONITOR_TARGET='game'; CFG_SOURCE['shutdown.monitor_target']="default";;
 esac
-WINESERVER_CLEANUP="$(cfg_select_bool 'shutdown.wineserver_cleanup' 'false' 'shutdown.wineserver_cleanup' 'wine.wineserver_kill_on_shutdown' 'wine.wineserver_wait_on_shutdown')"
+cfg_assign_select_bool WINESERVER_CLEANUP 'shutdown.wineserver_cleanup' 'false' 'shutdown.wineserver_cleanup' 'wine.wineserver_kill_on_shutdown' 'wine.wineserver_wait_on_shutdown'
 phase_end "bootstrap"
 
 phase_start "detect steam/prefix/runtime"
