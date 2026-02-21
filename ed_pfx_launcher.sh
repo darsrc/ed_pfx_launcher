@@ -625,13 +625,31 @@ launch_edcopilot() {
 
 build_windows_launch_cmd() {
   local exe_path="$1"
-  GAME_CMD_ARR=("$PROTON_BIN" run "$exe_path")
+
+  if [[ -x "${RUNTIME_CLIENT:-}" ]]; then
+    GAME_CMD_ARR=(
+      "$RUNTIME_CLIENT"
+      --bus-name="$BUS_NAME"
+      --pass-env-matching="WINE*"
+      --pass-env-matching="STEAM*"
+      --pass-env-matching="PROTON*"
+      --env="SteamGameId=$APPID"
+      -- "$WINELOADER" "$exe_path"
+    )
+  else
+    GAME_CMD_ARR=("$PROTON_BIN" run "$exe_path")
+  fi
 }
 
 launch_tool() {
   local tool_path="$1"
   local label="$2"
-  launch_wine_child "$label" "$PROTON_BIN" run "$tool_path"
+
+  if [[ -x "${RUNTIME_CLIENT:-}" ]]; then
+    launch_wine_child "$label" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- "$WINELOADER" "$tool_path"
+  else
+    launch_wine_child "$label" "$PROTON_BIN" run "$tool_path"
+  fi
 }
 
 build_game_command() {
@@ -832,8 +850,8 @@ while true; do
       ;;
     STATE_LAUNCH_EDCOPILOT)
       phase_start "STATE_LAUNCH_EDCOPILOT"
-      if (( ${#CLI_TOOLS[@]} > 0 )); then
-        log "Skipping managed EDCoPilot launch because explicit --tool entries were provided"
+      if [[ "$NO_GAME" -eq 1 && ${#CLI_TOOLS[@]} -gt 0 ]]; then
+        log "Skipping managed EDCoPilot launch in --no-game tool mode"
       elif [[ "$EDCOPILOT_ENABLED" == "true" && -f "$EDCOPILOT_EXE" ]]; then
         [[ "$EDCOPILOT_DELAY" -gt 0 ]] && sleep "$EDCOPILOT_DELAY"
         if ! launch_edcopilot "$EDCOPILOT_MODE"; then
