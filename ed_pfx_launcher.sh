@@ -279,7 +279,7 @@ wait_for_game_window() {
   while (( elapsed < timeout )); do
     game_pid="$(first_pid_for_pattern 'EliteDangerous64\.exe')"
     if [[ -n "$game_pid" ]]; then
-      DETECTED_KIND="mined"
+      DETECTED_KIND="game"
       DETECTED_PID="$game_pid"
       log "Detected game process (EliteDangerous64.exe) pid=$DETECTED_PID"
       return 0
@@ -308,10 +308,19 @@ wait_for_launcher() {
 
     edlaunch_pid="$(first_pid_for_pattern 'EDLaunch\.exe')"
     if [[ -n "$edlaunch_pid" ]]; then
-      DETECTED_KIND="edlaunch"
-      DETECTED_PID="$edlaunch_pid"
-      log "Detected EDLaunch process pid=$DETECTED_PID"
-      return 0
+      log "Detected EDLaunch process pid=$edlaunch_pid"
+
+      if [[ "$SHUTDOWN_MONITOR_TARGET" == "launcher" ]]; then
+        DETECTED_KIND="edlaunch"
+        DETECTED_PID="$edlaunch_pid"
+        return 0
+      fi
+
+      log "Waiting for EliteDangerous64.exe after EDLaunch detection"
+      if wait_for_game_window "$GAME_DETECT_TIMEOUT"; then
+        return 0
+      fi
+      return 1
     fi
 
     sleep 1
@@ -791,15 +800,15 @@ while true; do
           die "Launcher detection timed out after ${LAUNCHER_DETECT_TIMEOUT}s or game detection timed out after ${GAME_DETECT_TIMEOUT}s"
         fi
 
-        if [[ "$SHUTDOWN_MONITOR_TARGET" == "launcher" ]]; then
-          warn "monitor_target=launcher requested; MinEd mode monitors the game process"
-        fi
-        if [[ "$DETECTED_KIND" == "mined" ]]; then
+        if [[ "$DETECTED_KIND" == "game" ]]; then
           MONITOR_PID="$DETECTED_PID"
           log "Monitor lifecycle token=game pid=$MONITOR_PID"
+        elif [[ "$DETECTED_KIND" == "edlaunch" && "$SHUTDOWN_MONITOR_TARGET" == "launcher" ]]; then
+          MONITOR_PID="$DETECTED_PID"
+          log "Monitor lifecycle token=launcher pid=$MONITOR_PID"
         else
           phase_fail "STATE_WAIT_GAME" "unexpected detection kind"
-          die "Unexpected launcher detection result"
+          die "Unexpected detection result kind='$DETECTED_KIND' monitor_target='$SHUTDOWN_MONITOR_TARGET'"
         fi
       fi
       CURRENT_STATE="STATE_LAUNCH_EDCOPILOT"
