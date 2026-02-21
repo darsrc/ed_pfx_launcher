@@ -279,7 +279,7 @@ wait_for_game_window() {
   while (( elapsed < timeout )); do
     game_pid="$(first_pid_for_pattern 'EliteDangerous64\.exe')"
     if [[ -n "$game_pid" ]]; then
-      DETECTED_KIND="mined"
+      DETECTED_KIND="game"
       DETECTED_PID="$game_pid"
       log "Detected game process (EliteDangerous64.exe) pid=$DETECTED_PID"
       return 0
@@ -308,10 +308,19 @@ wait_for_launcher() {
 
     edlaunch_pid="$(first_pid_for_pattern 'EDLaunch\.exe')"
     if [[ -n "$edlaunch_pid" ]]; then
-      DETECTED_KIND="edlaunch"
-      DETECTED_PID="$edlaunch_pid"
-      log "Detected EDLaunch process pid=$DETECTED_PID"
-      return 0
+      log "Detected EDLaunch process pid=$edlaunch_pid"
+
+      if [[ "$SHUTDOWN_MONITOR_TARGET" == "launcher" ]]; then
+        DETECTED_KIND="edlaunch"
+        DETECTED_PID="$edlaunch_pid"
+        return 0
+      fi
+
+      log "Waiting for EliteDangerous64.exe after EDLaunch detection"
+      if wait_for_game_window "$GAME_DETECT_TIMEOUT"; then
+        return 0
+      fi
+      return 1
     fi
 
     sleep 1
@@ -614,6 +623,17 @@ launch_edcopilot() {
   return 1
 }
 
+build_windows_launch_cmd() {
+  local exe_path="$1"
+  GAME_CMD_ARR=("$PROTON_BIN" run "$exe_path")
+}
+
+launch_tool() {
+  local tool_path="$1"
+  local label="$2"
+  launch_wine_child "$label" "$PROTON_BIN" run "$tool_path"
+}
+
 build_game_command() {
   GAME_CMD_KIND=""
   GAME_WORKDIR=""
@@ -624,7 +644,7 @@ build_game_command() {
   fi
 
   local launcher_preference mined_exe edlaunch_exe
-  launcher_preference="${LAUNCHER_PREFERENCE:-edlaunch}"
+  launcher_preference="${LAUNCHER_PREFERENCE:-mined}"
   launcher_preference="${launcher_preference,,}"
 
   mined_exe="$(cfg_get 'elite.mined_exe' '')"
@@ -637,7 +657,7 @@ build_game_command() {
       if [[ -f "$edlaunch_exe" ]]; then
         GAME_CMD_KIND="edlaunch"
         GAME_WORKDIR="$(dirname "$edlaunch_exe")"
-        GAME_CMD_ARR=("$PROTON_BIN" run "$edlaunch_exe")
+        build_windows_launch_cmd "$edlaunch_exe"
         return 0
       fi
       die "elite.launcher_preference=edlaunch but EDLaunch.exe not found: $edlaunch_exe"
@@ -646,7 +666,7 @@ build_game_command() {
       if [[ -f "$mined_exe" ]]; then
         GAME_CMD_KIND="mined"
         GAME_WORKDIR="$(dirname "$mined_exe")"
-        GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe")
+        build_windows_launch_cmd "$mined_exe"
         return 0
       fi
       die "elite.launcher_preference=mined but MinEdLauncher.exe not found: $mined_exe"
@@ -655,13 +675,13 @@ build_game_command() {
       if [[ -f "$edlaunch_exe" ]]; then
         GAME_CMD_KIND="edlaunch"
         GAME_WORKDIR="$(dirname "$edlaunch_exe")"
-        GAME_CMD_ARR=("$PROTON_BIN" run "$edlaunch_exe")
+        build_windows_launch_cmd "$edlaunch_exe"
         return 0
       fi
       if [[ -f "$mined_exe" ]]; then
         GAME_CMD_KIND="mined"
         GAME_WORKDIR="$(dirname "$mined_exe")"
-        GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe")
+        build_windows_launch_cmd "$mined_exe"
         return 0
       fi
       ;;
@@ -670,13 +690,13 @@ build_game_command() {
       if [[ -f "$edlaunch_exe" ]]; then
         GAME_CMD_KIND="edlaunch"
         GAME_WORKDIR="$(dirname "$edlaunch_exe")"
-        GAME_CMD_ARR=("$PROTON_BIN" run "$edlaunch_exe")
+        build_windows_launch_cmd "$edlaunch_exe"
         return 0
       fi
       if [[ -f "$mined_exe" ]]; then
         GAME_CMD_KIND="mined"
         GAME_WORKDIR="$(dirname "$mined_exe")"
-        GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe")
+        build_windows_launch_cmd "$mined_exe"
         return 0
       fi
       ;;
@@ -685,7 +705,7 @@ build_game_command() {
   if [[ -f "$mined_exe" ]]; then
     GAME_CMD_KIND="mined"
     GAME_WORKDIR="$(dirname "$mined_exe")"
-    GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe")
+    build_windows_launch_cmd "$mined_exe"
     return 0
   fi
 
@@ -694,6 +714,11 @@ build_game_command() {
 }
 
 ini_load "$CONFIG_PATH"
+
+if [[ "$NO_GAME" -eq 1 && "$WAIT_TOOLS" -eq 0 && ${#CLI_TOOLS[@]} -gt 0 ]]; then
+  WAIT_TOOLS=1
+  log "Enabling --wait-tools automatically for --no-game with explicit --tool entries"
+fi
 
 phase_start "bootstrap"
 APPID="$(cfg_get 'steam.appid' "${SteamGameId:-359320}")"
@@ -709,7 +734,7 @@ EDCOPILOT_ALLOW_PROTON_FALLBACK="$(cfg_bool 'edcopilot.allow_proton_fallback' 'f
 EDCOPILOT_FORCE_LINUX_FLAG="$(cfg_bool 'edcopilot.force_linux_flag' 'true')"
 cfg_assign_select_int LAUNCHER_DETECT_TIMEOUT 'detection.launcher_timeout' '120' '1' 'detection.launcher_timeout' 'elite.launcher_detect_timeout'
 cfg_assign_select_int GAME_DETECT_TIMEOUT 'detection.game_timeout' '120' '1' 'detection.game_timeout' 'elite.game_detect_timeout'
-cfg_assign_select LAUNCHER_PREFERENCE 'elite.launcher_preference' 'edlaunch' 'elite.launcher_preference'
+cfg_assign_select LAUNCHER_PREFERENCE 'elite.launcher_preference' 'mined' 'elite.launcher_preference'
 EDCOPILOT_EXE_REL="$(cfg_get 'edcopilot.exe_rel' 'drive_c/EDCoPilot/LaunchEDCoPilot.exe')"
 EDCOPTER_ENABLED="$(cfg_bool 'edcopter.enabled' 'false')"
 EDCOPTER_SHUTDOWN_TIMEOUT="$(cfg_int 'edcopter.shutdown_timeout' '5' '1')"
@@ -791,15 +816,15 @@ while true; do
           die "Launcher detection timed out after ${LAUNCHER_DETECT_TIMEOUT}s or game detection timed out after ${GAME_DETECT_TIMEOUT}s"
         fi
 
-        if [[ "$SHUTDOWN_MONITOR_TARGET" == "launcher" ]]; then
-          warn "monitor_target=launcher requested; MinEd mode monitors the game process"
-        fi
-        if [[ "$DETECTED_KIND" == "mined" ]]; then
+        if [[ "$DETECTED_KIND" == "game" ]]; then
           MONITOR_PID="$DETECTED_PID"
           log "Monitor lifecycle token=game pid=$MONITOR_PID"
+        elif [[ "$DETECTED_KIND" == "edlaunch" && "$SHUTDOWN_MONITOR_TARGET" == "launcher" ]]; then
+          MONITOR_PID="$DETECTED_PID"
+          log "Monitor lifecycle token=launcher pid=$MONITOR_PID"
         else
           phase_fail "STATE_WAIT_GAME" "unexpected detection kind"
-          die "Unexpected launcher detection result"
+          die "Unexpected detection result kind='$DETECTED_KIND' monitor_target='$SHUTDOWN_MONITOR_TARGET'"
         fi
       fi
       CURRENT_STATE="STATE_LAUNCH_EDCOPILOT"
@@ -807,7 +832,9 @@ while true; do
       ;;
     STATE_LAUNCH_EDCOPILOT)
       phase_start "STATE_LAUNCH_EDCOPILOT"
-      if [[ "$EDCOPILOT_ENABLED" == "true" && -f "$EDCOPILOT_EXE" ]]; then
+      if (( ${#CLI_TOOLS[@]} > 0 )); then
+        log "Skipping managed EDCoPilot launch because explicit --tool entries were provided"
+      elif [[ "$EDCOPILOT_ENABLED" == "true" && -f "$EDCOPILOT_EXE" ]]; then
         [[ "$EDCOPILOT_DELAY" -gt 0 ]] && sleep "$EDCOPILOT_DELAY"
         if ! launch_edcopilot "$EDCOPILOT_MODE"; then
           phase_fail "STATE_LAUNCH_EDCOPILOT" "EDCoPilot launch/verification failed"
@@ -844,7 +871,7 @@ while true; do
       fi
       for t in "${CLI_TOOLS[@]}"; do
         [[ -f "$t" ]] || { warn "tool not found: $t"; continue; }
-        launch_wine_child "tool_$(basename "$t")" "$PROTON_BIN" run "$t"
+        launch_tool "$t" "tool_$(basename "$t")"
       done
       CURRENT_STATE="STATE_MONITOR"
       phase_end "STATE_LAUNCH_AUX"
