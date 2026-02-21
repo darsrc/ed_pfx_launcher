@@ -332,6 +332,29 @@ wait_for_launcher() {
 
 is_elite_running() { pgrep -f 'EliteDangerous64\.exe' >/dev/null 2>&1; }
 
+bus_name_has_owner() {
+  local bus_name="$1"
+
+  if have gdbus; then
+    timeout 2 gdbus call --session \
+      --dest org.freedesktop.DBus \
+      --object-path /org/freedesktop/DBus \
+      --method org.freedesktop.DBus.NameHasOwner \
+      "$bus_name" 2>/dev/null | grep -q '(true,'
+    return $?
+  fi
+
+  if have dbus-send; then
+    timeout 2 dbus-send --session --print-reply \
+      --dest=org.freedesktop.DBus \
+      /org/freedesktop/DBus \
+      org.freedesktop.DBus.NameHasOwner string:"$bus_name" 2>/dev/null | grep -q 'boolean true'
+    return $?
+  fi
+
+  return 1
+}
+
 # state enum via functions
 STATE_WAIT_LAUNCHER() { :; }
 STATE_WAIT_GAME() { :; }
@@ -626,7 +649,7 @@ launch_edcopilot() {
 build_windows_launch_cmd() {
   local exe_path="$1"
 
-  if [[ -x "${RUNTIME_CLIENT:-}" ]]; then
+  if [[ "${RUNTIME_CLIENT_READY:-false}" == "true" && -x "${RUNTIME_CLIENT:-}" ]]; then
     GAME_CMD_ARR=(
       "$RUNTIME_CLIENT"
       --bus-name="$BUS_NAME"
@@ -645,7 +668,7 @@ launch_tool() {
   local tool_path="$1"
   local label="$2"
 
-  if [[ -x "${RUNTIME_CLIENT:-}" ]]; then
+  if [[ "${RUNTIME_CLIENT_READY:-false}" == "true" && -x "${RUNTIME_CLIENT:-}" ]]; then
     launch_wine_child "$label" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- "$WINELOADER" "$tool_path"
   else
     launch_wine_child "$label" "$PROTON_BIN" run "$tool_path"
@@ -655,7 +678,28 @@ launch_tool() {
 build_game_command() {
   GAME_CMD_KIND=""
   GAME_WORKDIR=""
+  GAME_EXE_PATH=""
   GAME_CMD_ARR=()
+
+  local -a mined_args=()
+  if [[ -n "$ELITE_MINED_FLAGS" ]]; then
+    # shellcheck disable=SC2206
+    mined_args=( $ELITE_MINED_FLAGS )
+  fi
+
+  if [[ -n "$ELITE_PROFILE" ]]; then
+    local have_frontier=0 arg
+    for arg in "${mined_args[@]}"; do
+      if [[ "$arg" == "/frontier" ]]; then
+        have_frontier=1
+        break
+      fi
+    done
+
+    if [[ "$have_frontier" -eq 0 ]]; then
+      mined_args=("/frontier" "$ELITE_PROFILE" "${mined_args[@]}")
+    fi
+  fi
 
   if (( ${#FORWARDED_CMD[@]} > 0 )) && [[ "${FORWARDED_CMD[0]}" != "%command%" ]]; then
     warn "Ignoring forwarded command to enforce MinEdLauncher-only policy"
@@ -674,6 +718,7 @@ build_game_command() {
     edlaunch)
       if [[ -f "$edlaunch_exe" ]]; then
         GAME_CMD_KIND="edlaunch"
+        GAME_EXE_PATH="$edlaunch_exe"
         GAME_WORKDIR="$(dirname "$edlaunch_exe")"
         build_windows_launch_cmd "$edlaunch_exe"
         return 0
@@ -683,8 +728,9 @@ build_game_command() {
     mined)
       if [[ -f "$mined_exe" ]]; then
         GAME_CMD_KIND="mined"
+        GAME_EXE_PATH="$mined_exe"
         GAME_WORKDIR="$(dirname "$mined_exe")"
-        build_windows_launch_cmd "$mined_exe"
+        GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe" "${mined_args[@]}")
         return 0
       fi
       die "elite.launcher_preference=mined but MinEdLauncher.exe not found: $mined_exe"
@@ -692,14 +738,16 @@ build_game_command() {
     auto)
       if [[ -f "$edlaunch_exe" ]]; then
         GAME_CMD_KIND="edlaunch"
+        GAME_EXE_PATH="$edlaunch_exe"
         GAME_WORKDIR="$(dirname "$edlaunch_exe")"
         build_windows_launch_cmd "$edlaunch_exe"
         return 0
       fi
       if [[ -f "$mined_exe" ]]; then
         GAME_CMD_KIND="mined"
+        GAME_EXE_PATH="$mined_exe"
         GAME_WORKDIR="$(dirname "$mined_exe")"
-        build_windows_launch_cmd "$mined_exe"
+        GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe" "${mined_args[@]}")
         return 0
       fi
       ;;
@@ -707,14 +755,16 @@ build_game_command() {
       warn "Invalid elite.launcher_preference='$launcher_preference'; using auto"
       if [[ -f "$edlaunch_exe" ]]; then
         GAME_CMD_KIND="edlaunch"
+        GAME_EXE_PATH="$edlaunch_exe"
         GAME_WORKDIR="$(dirname "$edlaunch_exe")"
         build_windows_launch_cmd "$edlaunch_exe"
         return 0
       fi
       if [[ -f "$mined_exe" ]]; then
         GAME_CMD_KIND="mined"
+        GAME_EXE_PATH="$mined_exe"
         GAME_WORKDIR="$(dirname "$mined_exe")"
-        build_windows_launch_cmd "$mined_exe"
+        GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe" "${mined_args[@]}")
         return 0
       fi
       ;;
@@ -722,8 +772,9 @@ build_game_command() {
 
   if [[ -f "$mined_exe" ]]; then
     GAME_CMD_KIND="mined"
+    GAME_EXE_PATH="$mined_exe"
     GAME_WORKDIR="$(dirname "$mined_exe")"
-    build_windows_launch_cmd "$mined_exe"
+    GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe" "${mined_args[@]}")
     return 0
   fi
 
@@ -753,6 +804,8 @@ EDCOPILOT_FORCE_LINUX_FLAG="$(cfg_bool 'edcopilot.force_linux_flag' 'true')"
 cfg_assign_select_int LAUNCHER_DETECT_TIMEOUT 'detection.launcher_timeout' '120' '1' 'detection.launcher_timeout' 'elite.launcher_detect_timeout'
 cfg_assign_select_int GAME_DETECT_TIMEOUT 'detection.game_timeout' '120' '1' 'detection.game_timeout' 'elite.game_detect_timeout'
 cfg_assign_select LAUNCHER_PREFERENCE 'elite.launcher_preference' 'mined' 'elite.launcher_preference'
+ELITE_PROFILE="$(cfg_get 'elite.profile' 'default')"
+ELITE_MINED_FLAGS="$(cfg_get 'elite.mined_flags' '/autorun /autoquit /edo')"
 EDCOPILOT_EXE_REL="$(cfg_get 'edcopilot.exe_rel' 'drive_c/EDCoPilot/LaunchEDCoPilot.exe')"
 EDCOPTER_ENABLED="$(cfg_bool 'edcopter.enabled' 'false')"
 EDCOPTER_SHUTDOWN_TIMEOUT="$(cfg_int 'edcopter.shutdown_timeout' '5' '1')"
@@ -774,6 +827,14 @@ WINEPREFIX="$COMPATDATA_DIR/pfx"
 [[ -d "$WINEPREFIX" ]] || { phase_fail "detect steam/prefix/runtime" "wineprefix not found"; die "WINEPREFIX not found: $WINEPREFIX"; }
 RUNTIME_CLIENT="$(cfg_get 'steam.runtime_client' '')"
 [[ -z "$RUNTIME_CLIENT" ]] && RUNTIME_CLIENT="$(detect_runtime_client "$STEAM_ROOT" || true)"
+RUNTIME_CLIENT_READY="false"
+if [[ -n "$RUNTIME_CLIENT" && -x "$RUNTIME_CLIENT" ]]; then
+  if bus_name_has_owner "$BUS_NAME"; then
+    RUNTIME_CLIENT_READY="true"
+  else
+    warn "Steam bus '$BUS_NAME' is not available; using Proton directly"
+  fi
+fi
 PROTON_BIN="$(cfg_get 'proton.proton' '')"
 [[ -z "$PROTON_BIN" ]] && PROTON_BIN="$(find_proton "$STEAM_ROOT" || true)"
 [[ -n "$PROTON_BIN" && -x "$PROTON_BIN" ]] || { phase_fail "detect steam/prefix/runtime" "proton not found"; die "proton not found"; }
@@ -819,6 +880,18 @@ while true; do
           GAME_PID="$!"
           register_child "$GAME_PID"
           log "Game process started pid=$GAME_PID"
+
+          if [[ "${GAME_CMD_ARR[0]}" == "${RUNTIME_CLIENT:-}" ]]; then
+            sleep 3
+            if ! kill -0 "$GAME_PID" >/dev/null 2>&1; then
+              warn "Runtime launch exited early; retrying launch via Proton"
+              GAME_CMD_ARR=("$PROTON_BIN" run "$GAME_EXE_PATH")
+              "${GAME_CMD_ARR[@]}" &
+              GAME_PID="$!"
+              register_child "$GAME_PID"
+              log "Game process restarted via Proton pid=$GAME_PID"
+            fi
+          fi
         fi
       fi
       CURRENT_STATE="STATE_WAIT_GAME"
