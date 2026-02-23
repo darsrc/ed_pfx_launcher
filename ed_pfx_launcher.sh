@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eEuo pipefail
 IFS=$'\n\t'
 
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
@@ -12,9 +12,26 @@ LOG_FILE="$LOG_DIR/coordinator.log"
 : > "$LOG_FILE" || true
 
 _ts() { date +'%H:%M:%S'; }
-log() { echo "[$(_ts)] $*" | tee -a "$LOG_FILE" >/dev/null; }
-warn() { echo "[$(_ts)] WARN: $*" | tee -a "$LOG_FILE" >/dev/null; }
-die() { echo "[$(_ts)] ERROR: $*" | tee -a "$LOG_FILE" >/dev/null; exit 1; }
+DEBUG=0
+_emit_log_line() {
+  local line="$1"
+  echo "$line" | tee -a "$LOG_FILE" >/dev/null
+  if [[ "$DEBUG" -eq 1 ]]; then
+    echo "$line"
+  fi
+}
+log() { _emit_log_line "[$(_ts)] $*"; }
+warn() { _emit_log_line "[$(_ts)] WARN: $*"; }
+die() { _emit_log_line "[$(_ts)] ERROR: $*"; exit 1; }
+debug() { [[ "$DEBUG" -eq 1 ]] && log "[DEBUG] $*"; }
+
+on_error() {
+  local line_no="$1" cmd="$2" code="$3"
+  if [[ "$DEBUG" -eq 1 ]]; then
+    warn "[DEBUG] Command failed (exit=$code line=$line_no): $cmd"
+  fi
+}
+trap 'on_error "$LINENO" "$BASH_COMMAND" "$?"' ERR
 
 phase_start() { log "[PHASE:$1] START"; }
 phase_end() { log "[PHASE:$1] END"; }
@@ -26,13 +43,14 @@ CONFIG_PATH="$SCRIPT_DIR/ed_pfx_launcher.ini"
 NO_GAME=0
 WAIT_TOOLS=0
 DRY_RUN=0
+DEBUG=0
 declare -a CLI_TOOLS=()
 declare -a FORWARDED_CMD=()
 
 usage() {
   cat <<USAGE
 Usage:
-  $SCRIPT_NAME [--config <ini>] [--no-game] [--wait-tools] [--tool <exe>]... [--dry-run] [--] %command%
+  $SCRIPT_NAME [--config <ini>] [--no-game] [--wait-tools] [--tool <exe>]... [--dry-run] [--debug] [--] %command%
 USAGE
 }
 
@@ -43,11 +61,18 @@ while [[ $# -gt 0 ]]; do
     --no-game) NO_GAME=1; shift;;
     --wait-tools) WAIT_TOOLS=1; shift;;
     --dry-run) DRY_RUN=1; shift;;
+    --debug) DEBUG=1; shift;;
     -h|--help) usage; exit 0;;
     --) shift; FORWARDED_CMD=("$@"); break;;
     *) FORWARDED_CMD+=("$1"); shift;;
   esac
 done
+
+if [[ "$DEBUG" -eq 1 ]]; then
+  debug "Debug mode enabled"
+  export PS4='+ [${BASH_SOURCE##*/}:${LINENO}] '
+  set -x
+fi
 
 # INI parsing
 declare -A CFG=()
@@ -74,6 +99,26 @@ ini_load() {
       [[ -n "$section" && -n "$key" ]] && CFG["$section.$key"]="$val"
     fi
   done < "$file"
+}
+
+set_var() {
+  local name="$1" value="$2"
+  printf -v "$name" '%s' "$value"
+  debug "set $name=${!name}"
+}
+
+set_state() {
+  local next_state="$1"
+  debug "state transition: $CURRENT_STATE -> $next_state"
+  CURRENT_STATE="$next_state"
+}
+
+log_loaded_config() {
+  local key
+  debug "Loaded config entries from $CONFIG_PATH:"
+  for key in $(printf '%s\n' "${!CFG[@]}" | sort); do
+    debug "  $key=${CFG[$key]}"
+  done
 }
 
 cfg_get() { printf '%s' "${CFG[$1]:-${2:-}}"; }
@@ -279,8 +324,8 @@ wait_for_game_window() {
   while (( elapsed < timeout )); do
     game_pid="$(first_pid_for_pattern 'EliteDangerous64\.exe')"
     if [[ -n "$game_pid" ]]; then
-      DETECTED_KIND="game"
-      DETECTED_PID="$game_pid"
+      set_var DETECTED_KIND "game"
+      set_var DETECTED_PID "$game_pid"
       log "Detected game process (EliteDangerous64.exe) pid=$DETECTED_PID"
       return 0
     fi
@@ -311,8 +356,8 @@ wait_for_launcher() {
       log "Detected EDLaunch process pid=$edlaunch_pid"
 
       if [[ "$SHUTDOWN_MONITOR_TARGET" == "launcher" ]]; then
-        DETECTED_KIND="edlaunch"
-        DETECTED_PID="$edlaunch_pid"
+        set_var DETECTED_KIND "edlaunch"
+        set_var DETECTED_PID "$edlaunch_pid"
         return 0
       fi
 
@@ -364,7 +409,7 @@ STATE_LAUNCH_AUX() { :; }
 STATE_MONITOR() { :; }
 STATE_SHUTDOWN() { :; }
 
-CURRENT_STATE="STATE_WAIT_LAUNCHER"
+set_var CURRENT_STATE "STATE_WAIT_LAUNCHER"
 
 declare -a CHILD_PIDS=()
 register_child() { CHILD_PIDS+=("$1"); }
@@ -623,7 +668,7 @@ launch_edcopilot() {
   done
 
   if [[ -n "$runtime_client" ]]; then
-    RUNTIME_CLIENT="$runtime_client"
+    set_var RUNTIME_CLIENT "$runtime_client"
     log "Resolved runtime client from running process: $RUNTIME_CLIENT"
   elif [[ -n "${RUNTIME_CLIENT:-}" && -x "$RUNTIME_CLIENT" ]]; then
     log "Falling back to static runtime client: $RUNTIME_CLIENT"
@@ -783,15 +828,16 @@ build_game_command() {
 }
 
 ini_load "$CONFIG_PATH"
+log_loaded_config
 
 if [[ "$NO_GAME" -eq 1 && "$WAIT_TOOLS" -eq 0 && ${#CLI_TOOLS[@]} -gt 0 ]]; then
-  WAIT_TOOLS=1
+  set_var WAIT_TOOLS "1"
   log "Enabling --wait-tools automatically for --no-game with explicit --tool entries"
 fi
 
 phase_start "bootstrap"
-APPID="$(cfg_get 'steam.appid' "${SteamGameId:-359320}")"
-BUS_NAME="com.steampowered.App$APPID"
+set_var APPID "$(cfg_get 'steam.appid' "${SteamGameId:-359320}")"
+set_var BUS_NAME "com.steampowered.App$APPID"
 cfg_assign_select_bool EDCOPILOT_ENABLED 'edcopilot.enabled' 'true' 'edcopilot.enabled'
 cfg_assign_select EDCOPILOT_MODE 'edcopilot.mode' 'runtime' 'edcopilot.mode'
 cfg_assign_select_int EDCOPILOT_DELAY 'edcopilot.startup_delay' '30' '0' 'edcopilot.startup_delay' 'edcopilot.delay'
@@ -813,41 +859,41 @@ EDCOPTER_EXE_REL="$(cfg_get 'edcopter.exe_rel' '')"
 cfg_assign_select SHUTDOWN_MONITOR_TARGET 'shutdown.monitor_target' 'game' 'shutdown.monitor_target'
 case "$SHUTDOWN_MONITOR_TARGET" in
   launcher|game) ;;
-  *) warn "Invalid shutdown.monitor_target='$SHUTDOWN_MONITOR_TARGET'; defaulting to game"; SHUTDOWN_MONITOR_TARGET='game'; CFG_SOURCE['shutdown.monitor_target']="default";;
+  *) warn "Invalid shutdown.monitor_target='$SHUTDOWN_MONITOR_TARGET'; defaulting to game"; set_var SHUTDOWN_MONITOR_TARGET "game"; CFG_SOURCE['shutdown.monitor_target']="default";;
 esac
 cfg_assign_select_bool WINESERVER_CLEANUP 'shutdown.wineserver_cleanup' 'false' 'shutdown.wineserver_cleanup' 'wine.wineserver_kill_on_shutdown' 'wine.wineserver_wait_on_shutdown'
 phase_end "bootstrap"
 
 phase_start "detect steam/prefix/runtime"
-STEAM_ROOT="$(cfg_get 'steam.steam_root' '')"
-[[ -z "$STEAM_ROOT" ]] && STEAM_ROOT="$(detect_steam_root || true)"
+set_var STEAM_ROOT "$(cfg_get 'steam.steam_root' '')"
+[[ -z "$STEAM_ROOT" ]] && set_var STEAM_ROOT "$(detect_steam_root || true)"
 [[ -n "$STEAM_ROOT" && -d "$STEAM_ROOT" ]] || { phase_fail "detect steam/prefix/runtime" "steam root not found"; die "steam root not found"; }
-COMPATDATA_DIR="$(cfg_get 'steam.compatdata_dir' "${STEAM_COMPAT_DATA_PATH:-$STEAM_ROOT/steamapps/compatdata/$APPID}")"
-WINEPREFIX="$COMPATDATA_DIR/pfx"
+set_var COMPATDATA_DIR "$(cfg_get 'steam.compatdata_dir' "${STEAM_COMPAT_DATA_PATH:-$STEAM_ROOT/steamapps/compatdata/$APPID}")"
+set_var WINEPREFIX "$COMPATDATA_DIR/pfx"
 [[ -d "$WINEPREFIX" ]] || { phase_fail "detect steam/prefix/runtime" "wineprefix not found"; die "WINEPREFIX not found: $WINEPREFIX"; }
-RUNTIME_CLIENT="$(cfg_get 'steam.runtime_client' '')"
-[[ -z "$RUNTIME_CLIENT" ]] && RUNTIME_CLIENT="$(detect_runtime_client "$STEAM_ROOT" || true)"
-RUNTIME_CLIENT_READY="false"
+set_var RUNTIME_CLIENT "$(cfg_get 'steam.runtime_client' '')"
+[[ -z "$RUNTIME_CLIENT" ]] && set_var RUNTIME_CLIENT "$(detect_runtime_client "$STEAM_ROOT" || true)"
+set_var RUNTIME_CLIENT_READY "false"
 if [[ -n "$RUNTIME_CLIENT" && -x "$RUNTIME_CLIENT" ]]; then
   if bus_name_has_owner "$BUS_NAME"; then
-    RUNTIME_CLIENT_READY="true"
+    set_var RUNTIME_CLIENT_READY "true"
   else
     warn "Steam bus '$BUS_NAME' is not available; using Proton directly"
   fi
 fi
-PROTON_BIN="$(cfg_get 'proton.proton' '')"
-[[ -z "$PROTON_BIN" ]] && PROTON_BIN="$(find_proton "$STEAM_ROOT" || true)"
+set_var PROTON_BIN "$(cfg_get 'proton.proton' '')"
+[[ -z "$PROTON_BIN" ]] && set_var PROTON_BIN "$(find_proton "$STEAM_ROOT" || true)"
 [[ -n "$PROTON_BIN" && -x "$PROTON_BIN" ]] || { phase_fail "detect steam/prefix/runtime" "proton not found"; die "proton not found"; }
-WINELOADER="$(dirname "$PROTON_BIN")/files/bin/wine"
-EDCOPILOT_EXE="$(cfg_get 'edcopilot.exe' '')"
-[[ -z "$EDCOPILOT_EXE" ]] && EDCOPILOT_EXE="$WINEPREFIX/$EDCOPILOT_EXE_REL"
+set_var WINELOADER "$(dirname "$PROTON_BIN")/files/bin/wine"
+set_var EDCOPILOT_EXE "$(cfg_get 'edcopilot.exe' '')"
+[[ -z "$EDCOPILOT_EXE" ]] && set_var EDCOPILOT_EXE "$WINEPREFIX/$EDCOPILOT_EXE_REL"
 CFG_SOURCE['edcopilot.exe']="config:edcopilot.exe"
 if ! cfg_has 'edcopilot.exe'; then
   CFG_SOURCE['edcopilot.exe']="default:edcopilot.exe_rel"
 fi
 prepare_edcopilot_config "$EDCOPILOT_FORCE_LINUX_FLAG"
-EDCOPTER_EXE=""
-[[ -n "$EDCOPTER_EXE_REL" ]] && EDCOPTER_EXE="$WINEPREFIX/$EDCOPTER_EXE_REL"
+set_var EDCOPTER_EXE ""
+[[ -n "$EDCOPTER_EXE_REL" ]] && set_var EDCOPTER_EXE "$WINEPREFIX/$EDCOPTER_EXE_REL"
 export WINEPREFIX STEAM_COMPAT_DATA_PATH="$COMPATDATA_DIR" STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT" SteamGameId="$APPID" WINEDEBUG="-all"
 log_effective_config
 phase_end "detect steam/prefix/runtime"
@@ -862,10 +908,10 @@ else
 fi
 phase_end "detect launcher/game"
 
-GAME_PID=""
-DETECTED_KIND=""
-DETECTED_PID=""
-MONITOR_PID=""
+set_var GAME_PID ""
+set_var DETECTED_KIND ""
+set_var DETECTED_PID ""
+set_var MONITOR_PID ""
 
 while true; do
   case "$CURRENT_STATE" in
@@ -877,7 +923,7 @@ while true; do
         else
           [[ -n "$GAME_WORKDIR" ]] && cd "$GAME_WORKDIR"
           "${GAME_CMD_ARR[@]}" &
-          GAME_PID="$!"
+          set_var GAME_PID "$!"
           register_child "$GAME_PID"
           log "Game process started pid=$GAME_PID"
 
@@ -886,15 +932,16 @@ while true; do
             if ! kill -0 "$GAME_PID" >/dev/null 2>&1; then
               warn "Runtime launch exited early; retrying launch via Proton"
               GAME_CMD_ARR=("$PROTON_BIN" run "$GAME_EXE_PATH")
+              debug "updated GAME_CMD_ARR fallback to Proton run $GAME_EXE_PATH"
               "${GAME_CMD_ARR[@]}" &
-              GAME_PID="$!"
+              set_var GAME_PID "$!"
               register_child "$GAME_PID"
               log "Game process restarted via Proton pid=$GAME_PID"
             fi
           fi
         fi
       fi
-      CURRENT_STATE="STATE_WAIT_GAME"
+      set_state "STATE_WAIT_GAME"
       phase_end "STATE_WAIT_LAUNCHER"
       ;;
     STATE_WAIT_GAME)
@@ -908,17 +955,17 @@ while true; do
         fi
 
         if [[ "$DETECTED_KIND" == "game" ]]; then
-          MONITOR_PID="$DETECTED_PID"
+          set_var MONITOR_PID "$DETECTED_PID"
           log "Monitor lifecycle token=game pid=$MONITOR_PID"
         elif [[ "$DETECTED_KIND" == "edlaunch" && "$SHUTDOWN_MONITOR_TARGET" == "launcher" ]]; then
-          MONITOR_PID="$DETECTED_PID"
+          set_var MONITOR_PID "$DETECTED_PID"
           log "Monitor lifecycle token=launcher pid=$MONITOR_PID"
         else
           phase_fail "STATE_WAIT_GAME" "unexpected detection kind"
           die "Unexpected detection result kind='$DETECTED_KIND' monitor_target='$SHUTDOWN_MONITOR_TARGET'"
         fi
       fi
-      CURRENT_STATE="STATE_LAUNCH_EDCOPILOT"
+      set_state "STATE_LAUNCH_EDCOPILOT"
       phase_end "STATE_WAIT_GAME"
       ;;
     STATE_LAUNCH_EDCOPILOT)
@@ -934,13 +981,13 @@ while true; do
       else
         warn "EDCoPilot disabled or missing exe: $EDCOPILOT_EXE"
       fi
-      CURRENT_STATE="STATE_WAIT_EDCOPILOT_GUI"
+      set_state "STATE_WAIT_EDCOPILOT_GUI"
       phase_end "STATE_LAUNCH_EDCOPILOT"
       ;;
     STATE_WAIT_EDCOPILOT_GUI)
       phase_start "STATE_WAIT_EDCOPILOT_GUI"
       log "EDCoPilot GUI verification completed in launch phase"
-      CURRENT_STATE="STATE_LAUNCH_AUX"
+      set_state "STATE_LAUNCH_AUX"
       phase_end "STATE_WAIT_EDCOPILOT_GUI"
       ;;
     STATE_LAUNCH_AUX)
@@ -948,7 +995,7 @@ while true; do
       if [[ "$EDCOPTER_ENABLED" == "true" && -n "$EDCOPTER_EXE" && -f "$EDCOPTER_EXE" ]]; then
         runtime_client="$(resolve_runtime_client_from_processes || true)"
         if [[ -n "$runtime_client" ]]; then
-          RUNTIME_CLIENT="$runtime_client"
+          set_var RUNTIME_CLIENT "$runtime_client"
           log "Resolved runtime client from running process: $RUNTIME_CLIENT"
         elif [[ -n "${RUNTIME_CLIENT:-}" && -x "$RUNTIME_CLIENT" ]]; then
           log "Falling back to static runtime client: $RUNTIME_CLIENT"
@@ -964,7 +1011,7 @@ while true; do
         [[ -f "$t" ]] || { warn "tool not found: $t"; continue; }
         launch_tool "$t" "tool_$(basename "$t")"
       done
-      CURRENT_STATE="STATE_MONITOR"
+      set_state "STATE_MONITOR"
       phase_end "STATE_LAUNCH_AUX"
       ;;
     STATE_MONITOR)
@@ -982,7 +1029,7 @@ while true; do
         fi
         log "Game ended; transitioning to shutdown"
       fi
-      CURRENT_STATE="STATE_SHUTDOWN"
+      set_state "STATE_SHUTDOWN"
       phase_end "STATE_MONITOR"
       ;;
     STATE_SHUTDOWN)
