@@ -659,13 +659,21 @@ launch_edcopilot_runtime() {
 launch_edcopilot() {
   local mode="$1" runtime_client=""
   local waited=0
+  local bus_ready="false"
 
   while (( waited < EDCOPILOT_BUS_WAIT )); do
     runtime_client="$(resolve_runtime_client_from_processes || true)"
-    [[ -n "$runtime_client" ]] && break
+    if bus_name_has_owner "$BUS_NAME"; then
+      bus_ready="true"
+    fi
+    [[ -n "$runtime_client" && "$bus_ready" == "true" ]] && break
     sleep 1
     waited=$((waited + 1))
   done
+
+  if [[ "$bus_ready" != "true" ]] && bus_name_has_owner "$BUS_NAME"; then
+    bus_ready="true"
+  fi
 
   if [[ -n "$runtime_client" ]]; then
     set_var RUNTIME_CLIENT "$runtime_client"
@@ -676,8 +684,21 @@ launch_edcopilot() {
 
   if [[ "$mode" == "runtime" || ( "$mode" == "auto" && -n "$RUNTIME_CLIENT" ) ]]; then
     if [[ -x "${RUNTIME_CLIENT:-}" ]]; then
+      if [[ "$bus_ready" != "true" ]]; then
+        warn "Steam bus '$BUS_NAME' is not available; runtime launch is likely to fail"
+      fi
       launch_edcopilot_runtime "$RUNTIME_CLIENT"
-      return $?
+      if [[ $? -eq 0 ]]; then
+        return 0
+      fi
+
+      if [[ "$bus_ready" != "true" && "$EDCOPILOT_ALLOW_PROTON_FALLBACK" == "true" ]]; then
+        log "Retrying EDCoPilot via Proton fallback because Steam bus '$BUS_NAME' is unavailable"
+        launch_wine_child "edcopilot" "$PROTON_BIN" run "$EDCOPILOT_EXE"
+        return 0
+      fi
+
+      return 1
     fi
   fi
 
