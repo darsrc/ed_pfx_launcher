@@ -55,6 +55,7 @@ DEBUG=0
 declare -a CLI_TOOLS=()
 declare -a FORWARDED_CMD=()
 declare -a MINED_ARGS_ARR=()
+NO_GAME_TOOL_MODE=0
 
 usage() {
   cat <<USAGE
@@ -746,6 +747,11 @@ launch_tool() {
   local tool_path="$1"
   local label="$2"
 
+  if [[ "$NO_GAME_TOOL_MODE" -eq 1 ]]; then
+    launch_wine_child "$label" "$PROTON_BIN" run "$tool_path"
+    return 0
+  fi
+
   if [[ "${RUNTIME_CLIENT_READY:-false}" == "true" && -x "${RUNTIME_CLIENT:-}" ]]; then
     launch_wine_child "$label" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- "$WINELOADER" "$tool_path"
   else
@@ -863,9 +869,8 @@ build_game_command() {
 ini_load "$CONFIG_PATH"
 log_loaded_config
 
-if [[ "$NO_GAME" -eq 1 && "$WAIT_TOOLS" -eq 0 && ${#CLI_TOOLS[@]} -gt 0 ]]; then
-  set_var WAIT_TOOLS "1"
-  log "Enabling --wait-tools automatically for --no-game with explicit --tool entries"
+if [[ "$NO_GAME" -eq 1 && ${#CLI_TOOLS[@]} -gt 0 ]]; then
+  set_var NO_GAME_TOOL_MODE "1"
 fi
 
 phase_start "bootstrap"
@@ -913,6 +918,10 @@ if [[ -n "$RUNTIME_CLIENT" && -x "$RUNTIME_CLIENT" ]]; then
   else
     warn "Steam bus '$BUS_NAME' is not available; using Proton directly"
   fi
+fi
+if [[ "$NO_GAME_TOOL_MODE" -eq 1 ]]; then
+  set_var RUNTIME_CLIENT_READY "false"
+  log "No-game tool mode active: forcing Proton tool launches without Steam app bus attach"
 fi
 set_var PROTON_BIN "$(cfg_get 'proton.proton' '')"
 [[ -z "$PROTON_BIN" ]] && set_var PROTON_BIN "$(find_proton "$STEAM_ROOT" || true)"
