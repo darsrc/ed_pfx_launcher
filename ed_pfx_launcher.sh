@@ -39,6 +39,14 @@ phase_fail() { log "[PHASE:$1] FAIL: $2"; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+format_cmd_for_log() {
+  local -a parts=("$@")
+  local joined="${parts[*]}"
+  joined="${joined//\\/\\\\}"
+  joined="${joined//\"/\\\"}"
+  printf '"%s"' "$joined"
+}
+
 CONFIG_PATH="$SCRIPT_DIR/ed_pfx_launcher.ini"
 NO_GAME=0
 WAIT_TOOLS=0
@@ -927,7 +935,7 @@ phase_start "detect launcher/game"
 if [[ "$NO_GAME" -eq 0 ]]; then
   build_game_command
   log "Game launch kind=$GAME_CMD_KIND"
-  log "Game command=$(printf '%q ' "${GAME_CMD_ARR[@]}")"
+  log "Game command=$(format_cmd_for_log "${GAME_CMD_ARR[@]}")"
 else
   log "No-game mode enabled"
 fi
