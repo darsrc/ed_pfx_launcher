@@ -46,6 +46,7 @@ DRY_RUN=0
 DEBUG=0
 declare -a CLI_TOOLS=()
 declare -a FORWARDED_CMD=()
+declare -a MINED_ARGS_ARR=()
 
 usage() {
   cat <<USAGE
@@ -70,8 +71,6 @@ done
 
 if [[ "$DEBUG" -eq 1 ]]; then
   debug "Debug mode enabled"
-  export PS4='+ [${BASH_SOURCE##*/}:${LINENO}] '
-  set -x
 fi
 
 # INI parsing
@@ -730,6 +729,11 @@ build_windows_launch_cmd() {
   fi
 }
 
+build_mined_launch_cmd() {
+  local mined_exe="$1"
+  GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe" "${MINED_ARGS_ARR[@]}")
+}
+
 launch_tool() {
   local tool_path="$1"
   local label="$2"
@@ -747,15 +751,15 @@ build_game_command() {
   GAME_EXE_PATH=""
   GAME_CMD_ARR=()
 
-  local -a mined_args=()
+  MINED_ARGS_ARR=()
   if [[ -n "$ELITE_MINED_FLAGS" ]]; then
     # shellcheck disable=SC2206
-    mined_args=( $ELITE_MINED_FLAGS )
+    MINED_ARGS_ARR=( $ELITE_MINED_FLAGS )
   fi
 
   if [[ -n "$ELITE_PROFILE" ]]; then
     local have_frontier=0 arg
-    for arg in "${mined_args[@]}"; do
+    for arg in "${MINED_ARGS_ARR[@]}"; do
       if [[ "$arg" == "/frontier" ]]; then
         have_frontier=1
         break
@@ -763,7 +767,7 @@ build_game_command() {
     done
 
     if [[ "$have_frontier" -eq 0 ]]; then
-      mined_args=("/frontier" "$ELITE_PROFILE" "${mined_args[@]}")
+      MINED_ARGS_ARR=("/frontier" "$ELITE_PROFILE" "${MINED_ARGS_ARR[@]}")
     fi
   fi
 
@@ -796,7 +800,7 @@ build_game_command() {
         GAME_CMD_KIND="mined"
         GAME_EXE_PATH="$mined_exe"
         GAME_WORKDIR="$(dirname "$mined_exe")"
-        GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe" "${mined_args[@]}")
+        build_mined_launch_cmd "$mined_exe"
         return 0
       fi
       die "elite.launcher_preference=mined but MinEdLauncher.exe not found: $mined_exe"
@@ -813,7 +817,7 @@ build_game_command() {
         GAME_CMD_KIND="mined"
         GAME_EXE_PATH="$mined_exe"
         GAME_WORKDIR="$(dirname "$mined_exe")"
-        GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe" "${mined_args[@]}")
+        build_mined_launch_cmd "$mined_exe"
         return 0
       fi
       ;;
@@ -830,7 +834,7 @@ build_game_command() {
         GAME_CMD_KIND="mined"
         GAME_EXE_PATH="$mined_exe"
         GAME_WORKDIR="$(dirname "$mined_exe")"
-        GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe" "${mined_args[@]}")
+        build_mined_launch_cmd "$mined_exe"
         return 0
       fi
       ;;
@@ -840,7 +844,7 @@ build_game_command() {
     GAME_CMD_KIND="mined"
     GAME_EXE_PATH="$mined_exe"
     GAME_WORKDIR="$(dirname "$mined_exe")"
-    GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe" "${mined_args[@]}")
+    build_mined_launch_cmd "$mined_exe"
     return 0
   fi
 
@@ -952,8 +956,13 @@ while true; do
             sleep 3
             if ! kill -0 "$GAME_PID" >/dev/null 2>&1; then
               warn "Runtime launch exited early; retrying launch via Proton"
-              GAME_CMD_ARR=("$PROTON_BIN" run "$GAME_EXE_PATH")
-              debug "updated GAME_CMD_ARR fallback to Proton run $GAME_EXE_PATH"
+              if [[ "$GAME_CMD_KIND" == "mined" ]]; then
+                build_mined_launch_cmd "$GAME_EXE_PATH"
+                debug "updated GAME_CMD_ARR fallback to Proton run $GAME_EXE_PATH with MinEdLauncher args"
+              else
+                GAME_CMD_ARR=("$PROTON_BIN" run "$GAME_EXE_PATH")
+                debug "updated GAME_CMD_ARR fallback to Proton run $GAME_EXE_PATH"
+              fi
               "${GAME_CMD_ARR[@]}" &
               set_var GAME_PID "$!"
               register_child "$GAME_PID"
@@ -994,10 +1003,14 @@ while true; do
       if [[ "$NO_GAME" -eq 1 && ${#CLI_TOOLS[@]} -gt 0 ]]; then
         log "Skipping managed EDCoPilot launch in --no-game tool mode"
       elif [[ "$EDCOPILOT_ENABLED" == "true" && -f "$EDCOPILOT_EXE" ]]; then
-        [[ "$EDCOPILOT_DELAY" -gt 0 ]] && sleep "$EDCOPILOT_DELAY"
-        if ! launch_edcopilot "$EDCOPILOT_MODE"; then
-          phase_fail "STATE_LAUNCH_EDCOPILOT" "EDCoPilot launch/verification failed"
-          die "EDCoPilot failed to launch or EDCoPilotGUI2.exe was not detected"
+        if [[ "$NO_GAME" -eq 0 && "$DRY_RUN" -eq 0 ]] && ! is_elite_running; then
+          warn "EliteDangerous64.exe is not running; skipping EDCoPilot launch"
+        else
+          [[ "$EDCOPILOT_DELAY" -gt 0 ]] && sleep "$EDCOPILOT_DELAY"
+          if ! launch_edcopilot "$EDCOPILOT_MODE"; then
+            phase_fail "STATE_LAUNCH_EDCOPILOT" "EDCoPilot launch/verification failed"
+            die "EDCoPilot failed to launch or EDCoPilotGUI2.exe was not detected"
+          fi
         fi
       else
         warn "EDCoPilot disabled or missing exe: $EDCOPILOT_EXE"
