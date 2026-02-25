@@ -408,6 +408,81 @@ bus_name_has_owner() {
   return 1
 }
 
+extract_bus_name_from_command_line() {
+  local process_line="$1"
+  local bus_name=""
+
+  bus_name="$(printf '%s\n' "$process_line" | sed -n 's/.*--bus-name=\([^[:space:]]*\).*/\1/p' | head -n1)"
+  if [[ -z "$bus_name" ]]; then
+    bus_name="$(printf '%s\n' "$process_line" | sed -n 's/.*--bus-name[[:space:]]\+\([^[:space:]]*\).*/\1/p' | head -n1)"
+  fi
+
+  bus_name="${bus_name%\"}"
+  bus_name="${bus_name#\"}"
+  bus_name="${bus_name%\'}"
+  bus_name="${bus_name#\'}"
+
+  if [[ "$bus_name" =~ ^com\.[A-Za-z0-9_.-]+$ ]]; then
+    printf '%s' "$bus_name"
+    return 0
+  fi
+
+  return 1
+}
+
+list_session_bus_names() {
+  if have gdbus; then
+    timeout 2 gdbus call --session \
+      --dest org.freedesktop.DBus \
+      --object-path /org/freedesktop/DBus \
+      --method org.freedesktop.DBus.ListNames 2>/dev/null \
+      | grep -oE 'com\.[A-Za-z0-9_.-]+' || true
+    return 0
+  fi
+
+  if have dbus-send; then
+    timeout 2 dbus-send --session --print-reply \
+      --dest=org.freedesktop.DBus \
+      /org/freedesktop/DBus \
+      org.freedesktop.DBus.ListNames 2>/dev/null \
+      | sed -n 's/.*string "\(com\.[A-Za-z0-9_.-]*\)".*/\1/p' || true
+    return 0
+  fi
+
+  return 1
+}
+
+discover_runtime_bus_name() {
+  local fallback_bus="$1"
+  local process_line candidate
+
+  while IFS= read -r process_line; do
+    candidate="$(extract_bus_name_from_command_line "$process_line" || true)"
+    if [[ -n "$candidate" ]] && bus_name_has_owner "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done < <(pgrep -fa 'steam-runtime-launch-client|pressure-vessel' 2>/dev/null || true)
+
+  while IFS= read -r candidate; do
+    case "$candidate" in
+      com.steampowered.App*|com.steam.*)
+        if bus_name_has_owner "$candidate"; then
+          printf '%s' "$candidate"
+          return 0
+        fi
+        ;;
+    esac
+  done < <(list_session_bus_names || true)
+
+  if [[ -n "$fallback_bus" ]] && bus_name_has_owner "$fallback_bus"; then
+    printf '%s' "$fallback_bus"
+    return 0
+  fi
+
+  return 1
+}
+
 # state enum via functions
 STATE_WAIT_LAUNCHER() { :; }
 STATE_WAIT_GAME() { :; }
@@ -633,7 +708,7 @@ launch_edcopilot_runtime() {
   }
 
   "$runtime_client" \
-    --bus-name="com.steampowered.App${APPID}" \
+    --bus-name="$BUS_NAME" \
     --pass-env-matching="WINE*" \
     --pass-env-matching="STEAM*" \
     --pass-env-matching="PROTON*" \
@@ -665,13 +740,15 @@ launch_edcopilot_runtime() {
 }
 
 launch_edcopilot() {
-  local mode="$1" runtime_client=""
+  local mode="$1" runtime_client="" resolved_bus=""
   local waited=0
   local bus_ready="false"
 
   while (( waited < EDCOPILOT_BUS_WAIT )); do
     runtime_client="$(resolve_runtime_client_from_processes || true)"
-    if bus_name_has_owner "$BUS_NAME"; then
+    resolved_bus="$(discover_runtime_bus_name "$DEFAULT_BUS_NAME" || true)"
+    if [[ -n "$resolved_bus" ]]; then
+      set_var BUS_NAME "$resolved_bus"
       bus_ready="true"
     fi
     [[ -n "$runtime_client" && "$bus_ready" == "true" ]] && break
@@ -679,8 +756,12 @@ launch_edcopilot() {
     waited=$((waited + 1))
   done
 
-  if [[ "$bus_ready" != "true" ]] && bus_name_has_owner "$BUS_NAME"; then
-    bus_ready="true"
+  if [[ "$bus_ready" != "true" ]]; then
+    resolved_bus="$(discover_runtime_bus_name "$DEFAULT_BUS_NAME" || true)"
+    if [[ -n "$resolved_bus" ]]; then
+      set_var BUS_NAME "$resolved_bus"
+      bus_ready="true"
+    fi
   fi
 
   if [[ -n "$runtime_client" ]]; then
@@ -753,10 +834,17 @@ launch_tool() {
   fi
 
   if [[ "${RUNTIME_CLIENT_READY:-false}" == "true" && -x "${RUNTIME_CLIENT:-}" ]]; then
-    launch_wine_child "$label" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- "$WINELOADER" "$tool_path"
-  else
-    launch_wine_child "$label" "$PROTON_BIN" run "$tool_path"
+    local resolved_bus=""
+    resolved_bus="$(discover_runtime_bus_name "$DEFAULT_BUS_NAME" || true)"
+    if [[ -n "$resolved_bus" ]]; then
+      set_var BUS_NAME "$resolved_bus"
+      launch_wine_child "$label" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- "$WINELOADER" "$tool_path"
+      return 0
+    fi
+    warn "Steam runtime bus could not be detected for tool '$label'; falling back to Proton"
   fi
+
+  launch_wine_child "$label" "$PROTON_BIN" run "$tool_path"
 }
 
 build_game_command() {
@@ -876,6 +964,7 @@ fi
 phase_start "bootstrap"
 set_var APPID "$(cfg_get 'steam.appid' "${SteamGameId:-359320}")"
 set_var BUS_NAME "com.steampowered.App$APPID"
+set_var DEFAULT_BUS_NAME "$BUS_NAME"
 cfg_assign_select_bool EDCOPILOT_ENABLED 'edcopilot.enabled' 'true' 'edcopilot.enabled'
 cfg_assign_select EDCOPILOT_MODE 'edcopilot.mode' 'runtime' 'edcopilot.mode'
 cfg_assign_select_int EDCOPILOT_DELAY 'edcopilot.startup_delay' '30' '0' 'edcopilot.startup_delay' 'edcopilot.delay'
@@ -903,6 +992,7 @@ cfg_assign_select_bool WINESERVER_CLEANUP 'shutdown.wineserver_cleanup' 'false' 
 phase_end "bootstrap"
 
 phase_start "detect steam/prefix/runtime"
+detected_bus_name=""
 set_var STEAM_ROOT "$(cfg_get 'steam.steam_root' '')"
 [[ -z "$STEAM_ROOT" ]] && set_var STEAM_ROOT "$(detect_steam_root || true)"
 [[ -n "$STEAM_ROOT" && -d "$STEAM_ROOT" ]] || { phase_fail "detect steam/prefix/runtime" "steam root not found"; die "steam root not found"; }
@@ -913,10 +1003,13 @@ set_var RUNTIME_CLIENT "$(cfg_get 'steam.runtime_client' '')"
 [[ -z "$RUNTIME_CLIENT" ]] && set_var RUNTIME_CLIENT "$(detect_runtime_client "$STEAM_ROOT" || true)"
 set_var RUNTIME_CLIENT_READY "false"
 if [[ -n "$RUNTIME_CLIENT" && -x "$RUNTIME_CLIENT" ]]; then
-  if bus_name_has_owner "$BUS_NAME"; then
+  detected_bus_name="$(discover_runtime_bus_name "$DEFAULT_BUS_NAME" || true)"
+  if [[ -n "$detected_bus_name" ]]; then
+    set_var BUS_NAME "$detected_bus_name"
     set_var RUNTIME_CLIENT_READY "true"
+    log "Detected Steam runtime bus: $BUS_NAME"
   else
-    warn "Steam bus '$BUS_NAME' is not available; using Proton directly"
+    warn "Steam runtime bus is not available; using Proton directly"
   fi
 fi
 if [[ "$NO_GAME_TOOL_MODE" -eq 1 ]]; then
@@ -1053,7 +1146,14 @@ while true; do
         fi
 
         if [[ -x "${RUNTIME_CLIENT:-}" ]]; then
-          launch_wine_child "edcopter" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- "$WINELOADER" "$EDCOPTER_EXE"
+          resolved_bus="$(discover_runtime_bus_name "$DEFAULT_BUS_NAME" || true)"
+          if [[ -n "$resolved_bus" ]]; then
+            set_var BUS_NAME "$resolved_bus"
+            launch_wine_child "edcopter" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- "$WINELOADER" "$EDCOPTER_EXE"
+          else
+            warn "Steam runtime bus could not be detected for EDCoPTER; falling back to Proton"
+            launch_wine_child "edcopter" "$PROTON_BIN" run "$EDCOPTER_EXE"
+          fi
         else
           launch_wine_child "edcopter" "$PROTON_BIN" run "$EDCOPTER_EXE"
         fi
