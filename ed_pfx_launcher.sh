@@ -13,6 +13,7 @@ LOG_FILE="$LOG_DIR/coordinator.log"
 
 _ts() { date +'%H:%M:%S'; }
 DEBUG=0
+DEBUG_VERBOSE="${ED_PFX_TRACE:-0}"
 _emit_log_line() {
   local line="$1"
   echo "$line" | tee -a "$LOG_FILE" >/dev/null
@@ -26,6 +27,13 @@ die() { _emit_log_line "[$(_ts)] ERROR: $*"; exit 1; }
 debug() {
   [[ "$DEBUG" -eq 1 ]] || return 0
   local line="[$(_ts)] [DEBUG] $*"
+  echo "$line" >> "$LOG_FILE"
+  echo "$line" >&2
+}
+
+trace() {
+  [[ "$DEBUG" -eq 1 && "$DEBUG_VERBOSE" == "1" ]] || return 0
+  local line="[$(_ts)] [TRACE] $*"
   echo "$line" >> "$LOG_FILE"
   echo "$line" >&2
 }
@@ -55,11 +63,20 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 format_cmd_for_log() {
   local -a parts=("$@")
-  local joined="${parts[*]}"
-  joined="${joined//\\/\\\\}"
-  joined="${joined//\"/\\\"}"
+  local joined=""
+  local part
+
+  for part in "${parts[@]}"; do
+    if [[ -z "$joined" ]]; then
+      joined="$part"
+    else
+      joined+=" $part"
+    fi
+  done
+
   printf '"%s"' "$joined"
 }
+
 
 debug_cmd() {
   [[ "$DEBUG" -eq 1 ]] || return 0
@@ -75,6 +92,7 @@ declare -a CLI_TOOLS=()
 declare -a FORWARDED_CMD=()
 declare -a MINED_ARGS_ARR=()
 NO_GAME_TOOL_MODE=0
+STEAM_MODE=0
 
 usage() {
   cat <<USAGE
@@ -266,7 +284,9 @@ log_effective_config() {
   log "  edcopilot.init_timeout=$EDCOPILOT_INIT_TIMEOUT source=$(cfg_source_or_unknown 'edcopilot.init_timeout')"
   log "  edcopilot.graceful_shutdown_timeout=$EDCOPILOT_SHUTDOWN_TIMEOUT source=$(cfg_source_or_unknown 'edcopilot.graceful_shutdown_timeout')"
   log "  shutdown.monitor_target=$SHUTDOWN_MONITOR_TARGET source=$(cfg_source_or_unknown 'shutdown.monitor_target')"
+  log "  shutdown.close_tools_with_game=$CLOSE_TOOLS_ON_SHUTDOWN source=$(cfg_source_or_unknown 'shutdown.close_tools_with_game')"
   log "  shutdown.wineserver_cleanup=$WINESERVER_CLEANUP source=$(cfg_source_or_unknown 'shutdown.wineserver_cleanup')"
+  log "  audio.pulse_latency_msec=$PULSE_LATENCY_MSEC source=$(cfg_source_or_unknown 'audio.pulse_latency_msec')"
 }
 
 expand_tokens() {
@@ -436,15 +456,15 @@ debug_session_bus_snapshot() {
   local names=""
   names="$(list_session_bus_names || true)"
   if [[ -z "$names" ]]; then
-    debug "Session D-Bus names snapshot: <none or unavailable>"
+    trace "Session D-Bus names snapshot: <none or unavailable>"
     return 0
   fi
 
-  debug "Session D-Bus names snapshot (steam-related):"
+  trace "Session D-Bus names snapshot (steam-related):"
   while IFS= read -r name; do
     case "$name" in
       com.steampowered.App*|com.steam.*)
-        debug "  $name"
+        trace "  $name"
         ;;
     esac
   done <<< "$names"
@@ -456,13 +476,13 @@ debug_runtime_process_snapshot() {
   local lines=""
   lines="$(pgrep -fa 'steam-runtime-launch-client|pressure-vessel|EliteDangerous64\.exe|MinEdLauncher|EDLaunch\.exe' 2>/dev/null || true)"
   if [[ -z "$lines" ]]; then
-    debug "Runtime process snapshot: <no matching processes>"
+    trace "Runtime process snapshot: <no matching processes>"
     return 0
   fi
 
-  debug "Runtime process snapshot:"
+  trace "Runtime process snapshot:"
   while IFS= read -r line; do
-    debug "  $line"
+    trace "  $line"
   done <<< "$lines"
 }
 
@@ -470,15 +490,15 @@ debug_bus_diagnostics() {
   local context="$1" fallback_bus="$2"
   [[ "$DEBUG" -eq 1 ]] || return 0
 
-  debug "Bus diagnostics [$context]: fallback_bus=$fallback_bus DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-<unset>} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-<unset>}"
+  debug "Bus diagnostics [$context]: fallback_bus=$fallback_bus DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-<unset>}"
   debug_runtime_process_snapshot
   debug_session_bus_snapshot
 
   if [[ -n "$fallback_bus" ]]; then
     if bus_name_has_owner "$fallback_bus"; then
-      debug "Bus diagnostics [$context]: fallback bus has owner: $fallback_bus"
+      trace "Bus diagnostics [$context]: fallback bus has owner: $fallback_bus"
     else
-      debug "Bus diagnostics [$context]: fallback bus has no owner: $fallback_bus"
+      trace "Bus diagnostics [$context]: fallback bus has no owner: $fallback_bus"
     fi
   fi
 }
@@ -559,9 +579,9 @@ discover_runtime_bus_name() {
   debug_bus_diagnostics "discover_runtime_bus_name:start" "$fallback_bus"
 
   while IFS= read -r process_line; do
-    debug "discover_runtime_bus_name: checking process line: $process_line"
+    trace "discover_runtime_bus_name: checking process line: $process_line"
     candidate="$(extract_bus_name_from_command_line "$process_line" || true)"
-    [[ -n "$candidate" ]] && debug "discover_runtime_bus_name: extracted bus candidate: $candidate"
+    [[ -n "$candidate" ]] && trace "discover_runtime_bus_name: extracted bus candidate: $candidate"
     if [[ -n "$candidate" ]] && bus_name_has_owner "$candidate"; then
       debug "discover_runtime_bus_name: selected process-derived bus: $candidate"
       printf '%s' "$candidate"
@@ -570,9 +590,9 @@ discover_runtime_bus_name() {
 
     while IFS= read -r app_id; do
       [[ -n "$app_id" ]] || continue
-      debug "discover_runtime_bus_name: extracted appid candidate: $app_id"
+      trace "discover_runtime_bus_name: extracted appid candidate: $app_id"
       while IFS= read -r synthesized_bus; do
-        debug "discover_runtime_bus_name: checking synthesized bus candidate: $synthesized_bus"
+        trace "discover_runtime_bus_name: checking synthesized bus candidate: $synthesized_bus"
         if bus_name_has_owner "$synthesized_bus"; then
           debug "discover_runtime_bus_name: selected synthesized bus: $synthesized_bus"
           printf '%s' "$synthesized_bus"
@@ -585,7 +605,7 @@ discover_runtime_bus_name() {
   while IFS= read -r candidate; do
     case "$candidate" in
       com.steampowered.App*|com.steam.*)
-        debug "discover_runtime_bus_name: checking session bus candidate: $candidate"
+        trace "discover_runtime_bus_name: checking session bus candidate: $candidate"
         if bus_name_has_owner "$candidate"; then
           debug "discover_runtime_bus_name: selected session bus: $candidate"
           printf '%s' "$candidate"
@@ -954,7 +974,12 @@ build_windows_launch_cmd() {
 
 build_mined_launch_cmd() {
   local mined_exe="$1"
-  GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe" "${MINED_ARGS_ARR[@]}")
+
+  if [[ "$STEAM_MODE" -eq 1 ]]; then
+    GAME_CMD_ARR=("${FORWARDED_CMD[@]}" "${MINED_ARGS_ARR[@]}")
+  else
+    GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe" "${MINED_ARGS_ARR[@]}")
+  fi
 }
 
 launch_tool() {
@@ -992,8 +1017,10 @@ build_game_command() {
 
   MINED_ARGS_ARR=()
   if [[ -n "$ELITE_MINED_FLAGS" ]]; then
-    # shellcheck disable=SC2206
-    MINED_ARGS_ARR=( $ELITE_MINED_FLAGS )
+    local old_ifs="$IFS"
+    IFS=' '
+    read -r -a MINED_ARGS_ARR <<< "$ELITE_MINED_FLAGS"
+    IFS="$old_ifs"
   fi
 
   if [[ -n "$ELITE_PROFILE" ]]; then
@@ -1010,8 +1037,14 @@ build_game_command() {
     fi
   fi
 
-  if (( ${#FORWARDED_CMD[@]} > 0 )) && [[ "${FORWARDED_CMD[0]}" != "%command%" ]]; then
-    warn "Ignoring forwarded command to enforce MinEdLauncher-only policy"
+  STEAM_MODE=0
+  if (( ${#FORWARDED_CMD[@]} > 0 )); then
+    if [[ "${FORWARDED_CMD[0]}" == "%command%" ]]; then
+      warn "Literal %command% detected (terminal run). Steam expands it, your shell doesn't. Ignoring forwarded command."
+      FORWARDED_CMD=()
+    else
+      STEAM_MODE=1
+    fi
   fi
 
   local launcher_preference mined_exe edlaunch_exe
@@ -1114,7 +1147,7 @@ EDCOPILOT_FORCE_LINUX_FLAG="$(cfg_bool 'edcopilot.force_linux_flag' 'true')"
 cfg_assign_select_int LAUNCHER_DETECT_TIMEOUT 'detection.launcher_timeout' '120' '1' 'detection.launcher_timeout' 'elite.launcher_detect_timeout'
 cfg_assign_select_int GAME_DETECT_TIMEOUT 'detection.game_timeout' '120' '1' 'detection.game_timeout' 'elite.game_detect_timeout'
 cfg_assign_select LAUNCHER_PREFERENCE 'elite.launcher_preference' 'mined' 'elite.launcher_preference'
-ELITE_PROFILE="$(cfg_get 'elite.profile' 'default')"
+ELITE_PROFILE="$(cfg_get 'elite.profile' '')"
 ELITE_MINED_FLAGS="$(cfg_get 'elite.mined_flags' '/autorun /autoquit /edo')"
 EDCOPILOT_EXE_REL="$(cfg_get 'edcopilot.exe_rel' 'drive_c/EDCoPilot/LaunchEDCoPilot.exe')"
 EDCOPTER_ENABLED="$(cfg_bool 'edcopter.enabled' 'false')"
@@ -1126,6 +1159,8 @@ case "$SHUTDOWN_MONITOR_TARGET" in
   *) warn "Invalid shutdown.monitor_target='$SHUTDOWN_MONITOR_TARGET'; defaulting to game"; set_var SHUTDOWN_MONITOR_TARGET "game"; CFG_SOURCE['shutdown.monitor_target']="default";;
 esac
 cfg_assign_select_bool WINESERVER_CLEANUP 'shutdown.wineserver_cleanup' 'false' 'shutdown.wineserver_cleanup' 'wine.wineserver_kill_on_shutdown' 'wine.wineserver_wait_on_shutdown'
+cfg_assign_select_bool CLOSE_TOOLS_ON_SHUTDOWN 'shutdown.close_tools_with_game' 'false' 'shutdown.close_tools_with_game'
+cfg_assign_select PULSE_LATENCY_MSEC 'audio.pulse_latency_msec' '90' 'audio.pulse_latency_msec'
 phase_end "bootstrap"
 
 phase_start "detect steam/prefix/runtime"
@@ -1171,6 +1206,12 @@ fi
 prepare_edcopilot_config "$EDCOPILOT_FORCE_LINUX_FLAG"
 set_var EDCOPTER_EXE ""
 [[ -n "$EDCOPTER_EXE_REL" ]] && set_var EDCOPTER_EXE "$WINEPREFIX/$EDCOPTER_EXE_REL"
+if [[ "$PULSE_LATENCY_MSEC" =~ ^[0-9]+$ ]]; then
+  export PULSE_LATENCY_MSEC
+else
+  warn "Invalid audio.pulse_latency_msec='$PULSE_LATENCY_MSEC'; using 90"
+  export PULSE_LATENCY_MSEC="90"
+fi
 export WINEPREFIX STEAM_COMPAT_DATA_PATH="$COMPATDATA_DIR" STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT" SteamGameId="$APPID" WINEDEBUG="-all"
 log_effective_config
 phase_end "detect steam/prefix/runtime"
@@ -1179,6 +1220,7 @@ phase_start "detect launcher/game"
 if [[ "$NO_GAME" -eq 0 ]]; then
   build_game_command
   log "Game launch kind=$GAME_CMD_KIND"
+  log "Steam mode=$STEAM_MODE"
   log "Game command=$(format_cmd_for_log "${GAME_CMD_ARR[@]}")"
 else
   log "No-game mode enabled"
@@ -1189,6 +1231,7 @@ set_var GAME_PID ""
 set_var DETECTED_KIND ""
 set_var DETECTED_PID ""
 set_var MONITOR_PID ""
+set_var MONITOR_KIND ""
 
 while true; do
   case "$CURRENT_STATE" in
@@ -1237,9 +1280,11 @@ while true; do
         fi
 
         if [[ "$DETECTED_KIND" == "game" ]]; then
+          set_var MONITOR_KIND "game"
           set_var MONITOR_PID "$DETECTED_PID"
-          log "Monitor lifecycle token=game pid=$MONITOR_PID"
+          log "Monitor lifecycle token=game initial_pid=$MONITOR_PID"
         elif [[ "$DETECTED_KIND" == "edlaunch" && "$SHUTDOWN_MONITOR_TARGET" == "launcher" ]]; then
+          set_var MONITOR_KIND "launcher"
           set_var MONITOR_PID "$DETECTED_PID"
           log "Monitor lifecycle token=launcher pid=$MONITOR_PID"
         else
@@ -1311,12 +1356,18 @@ while true; do
     STATE_MONITOR)
       phase_start "STATE_MONITOR"
       if [[ "$NO_GAME" -eq 1 ]]; then
-        if [[ "$WAIT_TOOLS" -eq 1 ]]; then
-          log "No-game monitor active (--wait-tools); Ctrl+C to exit"
-          while true; do sleep 5; done
+        if [[ ${#CHILD_PIDS[@]} -gt 0 ]]; then
+          log "No-game monitor active; waiting while launched tools are still running"
+          while collect_pids_for_patterns 'EDCoPilotGUI2\.exe' 'LaunchEDCoPilot\.exe' 'EDCoPilot\.exe' 'EDCoPTER\.exe' | grep -q .; do
+            sleep 5
+          done
+        else
+          log "No-game monitor: no managed tool processes detected, exiting"
         fi
       elif [[ "$DRY_RUN" -eq 0 ]]; then
-        if [[ -n "$MONITOR_PID" ]]; then
+        if [[ "$MONITOR_KIND" == "game" ]]; then
+          while is_elite_running; do sleep 5; done
+        elif [[ -n "$MONITOR_PID" ]]; then
           while kill -0 "$MONITOR_PID" >/dev/null 2>&1; do sleep 5; done
         else
           while is_elite_running; do sleep 5; done
@@ -1328,20 +1379,24 @@ while true; do
       ;;
     STATE_SHUTDOWN)
       phase_start "STATE_SHUTDOWN"
-      if [[ "$EDCOPILOT_ENABLED" == "true" && -f "$EDCOPILOT_EXE" ]]; then
-        shutdown_edcopilot
-      fi
-      if [[ "$EDCOPTER_ENABLED" == "true" && -n "$EDCOPTER_EXE" && -f "$EDCOPTER_EXE" ]]; then
-        shutdown_edcopter
-      fi
-      cleanup_children
-      if [[ -x "$(dirname "$PROTON_BIN")/files/bin/wineserver" ]]; then
-        if [[ "$WINESERVER_CLEANUP" == "true" ]]; then
-          "$(dirname "$PROTON_BIN")/files/bin/wineserver" -k >/dev/null 2>&1 || true
-          log "Ran wineserver -k"
-          "$(dirname "$PROTON_BIN")/files/bin/wineserver" -w >/dev/null 2>&1 || true
-          log "Ran wineserver -w"
+      if [[ "$CLOSE_TOOLS_ON_SHUTDOWN" == "true" ]]; then
+        if [[ "$EDCOPILOT_ENABLED" == "true" && -f "$EDCOPILOT_EXE" ]]; then
+          shutdown_edcopilot
         fi
+        if [[ "$EDCOPTER_ENABLED" == "true" && -n "$EDCOPTER_EXE" && -f "$EDCOPTER_EXE" ]]; then
+          shutdown_edcopter
+        fi
+        cleanup_children
+        if [[ -x "$(dirname "$PROTON_BIN")/files/bin/wineserver" ]]; then
+          if [[ "$WINESERVER_CLEANUP" == "true" ]]; then
+            "$(dirname "$PROTON_BIN")/files/bin/wineserver" -k >/dev/null 2>&1 || true
+            log "Ran wineserver -k"
+            "$(dirname "$PROTON_BIN")/files/bin/wineserver" -w >/dev/null 2>&1 || true
+            log "Ran wineserver -w"
+          fi
+        fi
+      else
+        log "Leaving launched tools and wineserver running (shutdown.close_tools_with_game=false)"
       fi
       phase_end "STATE_SHUTDOWN"
       break
