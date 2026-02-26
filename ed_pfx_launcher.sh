@@ -982,6 +982,22 @@ build_mined_launch_cmd() {
   fi
 }
 
+launch_game_process() {
+  local game_log_file="$LOG_DIR/game.log"
+  local launch_dir="${GAME_WORKDIR:-}"
+
+  debug_cmd "game command" "${GAME_CMD_ARR[@]}"
+
+  if [[ -n "$launch_dir" ]]; then
+    (
+      cd "$launch_dir"
+      "${GAME_CMD_ARR[@]}"
+    ) >>"$game_log_file" 2>&1 &
+  else
+    "${GAME_CMD_ARR[@]}" >>"$game_log_file" 2>&1 &
+  fi
+}
+
 launch_tool() {
   local tool_path="$1"
   local label="$2"
