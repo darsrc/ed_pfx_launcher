@@ -982,26 +982,6 @@ build_mined_launch_cmd() {
   fi
 }
 
-launch_game_process() {
-  if [[ "$GAME_CMD_KIND" == "mined" && "$STEAM_MODE" -eq 0 ]]; then
-    (
-      cd "$GAME_WORKDIR"
-      "$PROTON_BIN" run "$GAME_EXE_PATH" "${MINED_ARGS_ARR[@]}"
-    ) &
-    return 0
-  fi
-
-  if [[ -n "$GAME_WORKDIR" ]]; then
-    (
-      cd "$GAME_WORKDIR"
-      "${GAME_CMD_ARR[@]}"
-    ) &
-    return 0
-  fi
-
-  "${GAME_CMD_ARR[@]}" &
-}
-
 launch_tool() {
   local tool_path="$1"
   local label="$2"
