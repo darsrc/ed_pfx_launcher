@@ -1241,19 +1241,7 @@ while true; do
         if [[ "$DRY_RUN" -eq 1 ]]; then
           log "DRY-RUN would launch game command"
         else
-          if [[ "$GAME_CMD_KIND" == "mined" && "$STEAM_MODE" -eq 0 ]]; then
-            (
-              cd "$GAME_WORKDIR"
-              "$PROTON_BIN" run "$GAME_EXE_PATH" "${MINED_ARGS_ARR[@]}"
-            ) &
-          elif [[ -n "$GAME_WORKDIR" ]]; then
-            (
-              cd "$GAME_WORKDIR"
-              "${GAME_CMD_ARR[@]}"
-            ) &
-          else
-            "${GAME_CMD_ARR[@]}" &
-          fi
+          launch_game_process
           set_var GAME_PID "$!"
           register_child "$GAME_PID"
           log "Game process started pid=$GAME_PID"
@@ -1269,19 +1257,7 @@ while true; do
                 GAME_CMD_ARR=("$PROTON_BIN" run "$GAME_EXE_PATH")
                 debug "updated GAME_CMD_ARR fallback to Proton run $GAME_EXE_PATH"
               fi
-              if [[ "$GAME_CMD_KIND" == "mined" && "$STEAM_MODE" -eq 0 ]]; then
-                (
-                  cd "$GAME_WORKDIR"
-                  "$PROTON_BIN" run "$GAME_EXE_PATH" "${MINED_ARGS_ARR[@]}"
-                ) &
-              elif [[ -n "$GAME_WORKDIR" ]]; then
-                (
-                  cd "$GAME_WORKDIR"
-                  "${GAME_CMD_ARR[@]}"
-                ) &
-              else
-                "${GAME_CMD_ARR[@]}" &
-              fi
+              launch_game_process
               set_var GAME_PID "$!"
               register_child "$GAME_PID"
               log "Game process restarted via Proton pid=$GAME_PID"
