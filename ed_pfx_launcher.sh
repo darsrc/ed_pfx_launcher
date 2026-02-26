@@ -63,11 +63,20 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 format_cmd_for_log() {
   local -a parts=("$@")
-  local joined="${parts[*]}"
-  joined="${joined//\\/\\\\}"
-  joined="${joined//\"/\\\"}"
+  local joined=""
+  local part
+
+  for part in "${parts[@]}"; do
+    if [[ -z "$joined" ]]; then
+      joined="$part"
+    else
+      joined+=" $part"
+    fi
+  done
+
   printf '"%s"' "$joined"
 }
+
 
 debug_cmd() {
   [[ "$DEBUG" -eq 1 ]] || return 0
