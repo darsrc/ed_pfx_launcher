@@ -83,6 +83,7 @@ declare -a CLI_TOOLS=()
 declare -a FORWARDED_CMD=()
 declare -a MINED_ARGS_ARR=()
 NO_GAME_TOOL_MODE=0
+STEAM_MODE=0
 
 usage() {
   cat <<USAGE
@@ -964,7 +965,12 @@ build_windows_launch_cmd() {
 
 build_mined_launch_cmd() {
   local mined_exe="$1"
-  GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe" "${MINED_ARGS_ARR[@]}")
+
+  if [[ "$STEAM_MODE" -eq 1 ]]; then
+    GAME_CMD_ARR=("${FORWARDED_CMD[@]}" "${MINED_ARGS_ARR[@]}")
+  else
+    GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe" "${MINED_ARGS_ARR[@]}")
+  fi
 }
 
 launch_tool() {
@@ -1022,8 +1028,14 @@ build_game_command() {
     fi
   fi
 
-  if (( ${#FORWARDED_CMD[@]} > 0 )) && [[ "${FORWARDED_CMD[0]}" != "%command%" ]]; then
-    warn "Ignoring forwarded command to enforce MinEdLauncher-only policy"
+  STEAM_MODE=0
+  if (( ${#FORWARDED_CMD[@]} > 0 )); then
+    if [[ "${FORWARDED_CMD[0]}" == "%command%" ]]; then
+      warn "Literal %command% detected (terminal run). Steam expands it, your shell doesn't. Ignoring forwarded command."
+      FORWARDED_CMD=()
+    else
+      STEAM_MODE=1
+    fi
   fi
 
   local launcher_preference mined_exe edlaunch_exe
@@ -1199,6 +1211,7 @@ phase_start "detect launcher/game"
 if [[ "$NO_GAME" -eq 0 ]]; then
   build_game_command
   log "Game launch kind=$GAME_CMD_KIND"
+  log "Steam mode=$STEAM_MODE"
   log "Game command=$(format_cmd_for_log "${GAME_CMD_ARR[@]}")"
 else
   log "No-game mode enabled"
