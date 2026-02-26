@@ -1002,8 +1002,10 @@ build_game_command() {
 
   MINED_ARGS_ARR=()
   if [[ -n "$ELITE_MINED_FLAGS" ]]; then
-    # shellcheck disable=SC2206
-    MINED_ARGS_ARR=( $ELITE_MINED_FLAGS )
+    local old_ifs="$IFS"
+    IFS=' '
+    read -r -a MINED_ARGS_ARR <<< "$ELITE_MINED_FLAGS"
+    IFS="$old_ifs"
   fi
 
   if [[ -n "$ELITE_PROFILE" ]]; then
