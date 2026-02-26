@@ -68,13 +68,15 @@ format_cmd_for_log() {
 
   for part in "${parts[@]}"; do
     if [[ -z "$joined" ]]; then
-      joined="$part"
+      printf -v joined '%q' "$part"
     else
-      joined+=" $part"
+      local escaped
+      printf -v escaped '%q' "$part"
+      joined+=" $escaped"
     fi
   done
 
-  printf '"%s"' "$joined"
+  printf '%s' "$joined"
 }
 
 
@@ -93,11 +95,13 @@ declare -a FORWARDED_CMD=()
 declare -a MINED_ARGS_ARR=()
 NO_GAME_TOOL_MODE=0
 STEAM_MODE=0
+PASS_COMMAND="false"
+PASS_COMMAND_EXPLICIT="false"
 
 usage() {
   cat <<USAGE
 Usage:
-  $SCRIPT_NAME [--config <ini>] [--no-game] [--wait-tools] [--tool <exe>]... [--dry-run] [--debug] [--] %command%
+  $SCRIPT_NAME [--config <ini>] [--no-game] [--wait-tools] [--tool <exe>]... [--dry-run] [--pass-command|--no-pass-command] [--debug] [--] %command%
 USAGE
 }
 
@@ -108,6 +112,8 @@ while [[ $# -gt 0 ]]; do
     --no-game) NO_GAME=1; shift;;
     --wait-tools) WAIT_TOOLS=1; shift;;
     --dry-run) DRY_RUN=1; shift;;
+    --pass-command) PASS_COMMAND="true"; PASS_COMMAND_EXPLICIT="true"; shift;;
+    --no-pass-command) PASS_COMMAND="false"; PASS_COMMAND_EXPLICIT="true"; shift;;
     --debug|--degbug) DEBUG=1; shift;;
     -h|--help) usage; exit 0;;
     --) shift; FORWARDED_CMD=("$@"); break;;
@@ -276,6 +282,7 @@ log_effective_config() {
   log "  detection.launcher_timeout=$LAUNCHER_DETECT_TIMEOUT source=$(cfg_source_or_unknown 'detection.launcher_timeout')"
   log "  detection.game_timeout=$GAME_DETECT_TIMEOUT source=$(cfg_source_or_unknown 'detection.game_timeout')"
   log "  elite.launcher_preference=$LAUNCHER_PREFERENCE source=$(cfg_source_or_unknown 'elite.launcher_preference')"
+  log "  elite.pass_command=$PASS_COMMAND source=$(cfg_source_or_unknown 'elite.pass_command')"
   log "  edcopilot.enabled=$EDCOPILOT_ENABLED source=$(cfg_source_or_unknown 'edcopilot.enabled')"
   log "  edcopilot.exe=$EDCOPILOT_EXE source=$(cfg_source_or_unknown 'edcopilot.exe')"
   log "  edcopilot.mode=$EDCOPILOT_MODE source=$(cfg_source_or_unknown 'edcopilot.mode')"
@@ -1007,11 +1014,48 @@ build_windows_launch_cmd() {
 
 build_mined_launch_cmd() {
   local mined_exe="$1"
+  local mined_native=""
+  local mined_dir=""
+  local pass_command_effective="$PASS_COMMAND"
 
-  if [[ "$STEAM_MODE" -eq 1 ]]; then
-    GAME_CMD_ARR=("${FORWARDED_CMD[@]}" "${MINED_ARGS_ARR[@]}")
+  if [[ "$mined_exe" == */MinEdLauncher.exe ]]; then
+    mined_dir="$(dirname "$mined_exe")"
+    if [[ -x "$mined_dir/MinEdLauncher" ]]; then
+      mined_native="$mined_dir/MinEdLauncher"
+    fi
+  fi
+
+  if [[ "$STEAM_MODE" -eq 1 && -n "$mined_native" && "$PASS_COMMAND_EXPLICIT" != "true" ]]; then
+    pass_command_effective="true"
+  fi
+
+  if [[ -n "$mined_native" ]]; then
+    # MinEdLauncher contract: %command% tokens (optional) must come before MinEd flags.
+    GAME_CMD_ARR=("$mined_native")
+    if [[ "$STEAM_MODE" -eq 1 && "$pass_command_effective" == "true" && ${#FORWARDED_CMD[@]} -gt 0 ]]; then
+      GAME_CMD_ARR+=("${FORWARDED_CMD[@]}")
+    fi
+    GAME_CMD_ARR+=("${MINED_ARGS_ARR[@]}")
+  elif [[ "${RUNTIME_CLIENT_READY:-false}" == "true" && -x "${RUNTIME_CLIENT:-}" ]]; then
+    GAME_CMD_ARR=(
+      "$RUNTIME_CLIENT"
+      --bus-name="$BUS_NAME"
+      --pass-env-matching="WINE*"
+      --pass-env-matching="STEAM*"
+      --pass-env-matching="PROTON*"
+      --env="SteamGameId=$APPID"
+      -- "$WINELOADER" "$mined_exe"
+    )
+    if [[ "$STEAM_MODE" -eq 1 && "$pass_command_effective" == "true" && ${#FORWARDED_CMD[@]} -gt 0 ]]; then
+      GAME_CMD_ARR+=("${FORWARDED_CMD[@]}")
+    fi
+    GAME_CMD_ARR+=("${MINED_ARGS_ARR[@]}")
   else
-    GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe" "${MINED_ARGS_ARR[@]}")
+    GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe")
+    if [[ "$STEAM_MODE" -eq 1 && "$pass_command_effective" == "true" && ${#FORWARDED_CMD[@]} -gt 0 ]]; then
+      GAME_CMD_ARR+=("${FORWARDED_CMD[@]}")
+    fi
+    GAME_CMD_ARR+=("${MINED_ARGS_ARR[@]}")
   fi
 }
 
@@ -1226,6 +1270,15 @@ EDCOPILOT_FORCE_LINUX_FLAG="$(cfg_bool 'edcopilot.force_linux_flag' 'true')"
 cfg_assign_select_int LAUNCHER_DETECT_TIMEOUT 'detection.launcher_timeout' '120' '1' 'detection.launcher_timeout' 'elite.launcher_detect_timeout'
 cfg_assign_select_int GAME_DETECT_TIMEOUT 'detection.game_timeout' '120' '1' 'detection.game_timeout' 'elite.game_detect_timeout'
 cfg_assign_select LAUNCHER_PREFERENCE 'elite.launcher_preference' 'mined' 'elite.launcher_preference'
+if [[ "$PASS_COMMAND_EXPLICIT" == "true" ]]; then
+  CFG_SOURCE['elite.pass_command']="cli"
+elif cfg_has 'elite.pass_command'; then
+  PASS_COMMAND="$(cfg_bool 'elite.pass_command' 'false')"
+  CFG_SOURCE['elite.pass_command']="config:elite.pass_command"
+else
+  PASS_COMMAND="false"
+  CFG_SOURCE['elite.pass_command']="default"
+fi
 ELITE_PROFILE="$(cfg_get 'elite.profile' '')"
 ELITE_MINED_FLAGS="$(cfg_get 'elite.mined_flags' '/autorun /autoquit /edo')"
 EDCOPILOT_EXE_REL="$(cfg_get 'edcopilot.exe_rel' 'drive_c/EDCoPilot/LaunchEDCoPilot.exe')"
@@ -1243,7 +1296,7 @@ cfg_assign_select PULSE_LATENCY_MSEC 'audio.pulse_latency_msec' '90' 'audio.puls
 phase_end "bootstrap"
 
 phase_start "detect steam/prefix/runtime"
-debug "CLI modes: NO_GAME=$NO_GAME WAIT_TOOLS=$WAIT_TOOLS NO_GAME_TOOL_MODE=$NO_GAME_TOOL_MODE DRY_RUN=$DRY_RUN"
+debug "CLI modes: NO_GAME=$NO_GAME WAIT_TOOLS=$WAIT_TOOLS NO_GAME_TOOL_MODE=$NO_GAME_TOOL_MODE DRY_RUN=$DRY_RUN PASS_COMMAND=$PASS_COMMAND"
 detected_bus_name=""
 set_var STEAM_ROOT "$(cfg_get 'steam.steam_root' '')"
 [[ -z "$STEAM_ROOT" ]] && set_var STEAM_ROOT "$(detect_steam_root || true)"
@@ -1305,6 +1358,12 @@ else
   log "No-game mode enabled"
 fi
 phase_end "detect launcher/game"
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  log "DRY-RUN resolved game command=$(format_cmd_for_log "${GAME_CMD_ARR[@]}")"
+  log "DRY-RUN exiting before launching processes"
+  exit 0
+fi
 
 set_var GAME_PID ""
 set_var DETECTED_KIND ""
