@@ -47,6 +47,11 @@ format_cmd_for_log() {
   printf '"%s"' "$joined"
 }
 
+debug_cmd() {
+  [[ "$DEBUG" -eq 1 ]] || return 0
+  log "[DEBUG] $1=$(format_cmd_for_log "${@:2}")"
+}
+
 CONFIG_PATH="$SCRIPT_DIR/ed_pfx_launcher.ini"
 NO_GAME=0
 WAIT_TOOLS=0
@@ -71,7 +76,7 @@ while [[ $# -gt 0 ]]; do
     --no-game) NO_GAME=1; shift;;
     --wait-tools) WAIT_TOOLS=1; shift;;
     --dry-run) DRY_RUN=1; shift;;
-    --debug) DEBUG=1; shift;;
+    --debug|--degbug) DEBUG=1; shift;;
     -h|--help) usage; exit 0;;
     --) shift; FORWARDED_CMD=("$@"); break;;
     *) FORWARDED_CMD+=("$1"); shift;;
@@ -408,6 +413,60 @@ bus_name_has_owner() {
   return 1
 }
 
+
+debug_session_bus_snapshot() {
+  [[ "$DEBUG" -eq 1 ]] || return 0
+
+  local names=""
+  names="$(list_session_bus_names || true)"
+  if [[ -z "$names" ]]; then
+    debug "Session D-Bus names snapshot: <none or unavailable>"
+    return 0
+  fi
+
+  debug "Session D-Bus names snapshot (steam-related):"
+  while IFS= read -r name; do
+    case "$name" in
+      com.steampowered.App*|com.steam.*)
+        debug "  $name"
+        ;;
+    esac
+  done <<< "$names"
+}
+
+debug_runtime_process_snapshot() {
+  [[ "$DEBUG" -eq 1 ]] || return 0
+
+  local lines=""
+  lines="$(pgrep -fa 'steam-runtime-launch-client|pressure-vessel|EliteDangerous64\.exe|MinEdLauncher|EDLaunch\.exe' 2>/dev/null || true)"
+  if [[ -z "$lines" ]]; then
+    debug "Runtime process snapshot: <no matching processes>"
+    return 0
+  fi
+
+  debug "Runtime process snapshot:"
+  while IFS= read -r line; do
+    debug "  $line"
+  done <<< "$lines"
+}
+
+debug_bus_diagnostics() {
+  local context="$1" fallback_bus="$2"
+  [[ "$DEBUG" -eq 1 ]] || return 0
+
+  debug "Bus diagnostics [$context]: fallback_bus=$fallback_bus DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-<unset>} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-<unset>}"
+  debug_runtime_process_snapshot
+  debug_session_bus_snapshot
+
+  if [[ -n "$fallback_bus" ]]; then
+    if bus_name_has_owner "$fallback_bus"; then
+      debug "Bus diagnostics [$context]: fallback bus has owner: $fallback_bus"
+    else
+      debug "Bus diagnostics [$context]: fallback bus has no owner: $fallback_bus"
+    fi
+  fi
+}
+
 extract_bus_name_from_command_line() {
   local process_line="$1"
   local bus_name=""
@@ -456,9 +515,14 @@ discover_runtime_bus_name() {
   local fallback_bus="$1"
   local process_line candidate
 
+  debug_bus_diagnostics "discover_runtime_bus_name:start" "$fallback_bus"
+
   while IFS= read -r process_line; do
+    debug "discover_runtime_bus_name: checking process line: $process_line"
     candidate="$(extract_bus_name_from_command_line "$process_line" || true)"
+    [[ -n "$candidate" ]] && debug "discover_runtime_bus_name: extracted bus candidate: $candidate"
     if [[ -n "$candidate" ]] && bus_name_has_owner "$candidate"; then
+      debug "discover_runtime_bus_name: selected process-derived bus: $candidate"
       printf '%s' "$candidate"
       return 0
     fi
@@ -467,7 +531,9 @@ discover_runtime_bus_name() {
   while IFS= read -r candidate; do
     case "$candidate" in
       com.steampowered.App*|com.steam.*)
+        debug "discover_runtime_bus_name: checking session bus candidate: $candidate"
         if bus_name_has_owner "$candidate"; then
+          debug "discover_runtime_bus_name: selected session bus: $candidate"
           printf '%s' "$candidate"
           return 0
         fi
@@ -476,10 +542,12 @@ discover_runtime_bus_name() {
   done < <(list_session_bus_names || true)
 
   if [[ -n "$fallback_bus" ]] && bus_name_has_owner "$fallback_bus"; then
+    debug "discover_runtime_bus_name: selected fallback bus: $fallback_bus"
     printf '%s' "$fallback_bus"
     return 0
   fi
 
+  debug "discover_runtime_bus_name: no bus detected"
   return 1
 }
 
@@ -598,9 +666,11 @@ shutdown_edcopter() {
 launch_wine_child() {
   local label="$1"; shift
   local log_file="$LOG_DIR/${label}.log"
+  debug_cmd "child[$label] command" "$@"
   [[ "$DRY_RUN" -eq 1 ]] && { log "DRY-RUN child[$label]: $*"; return 0; }
   "$@" >>"$log_file" 2>&1 &
   register_child "$!"
+  debug "child[$label] started pid=$! log=$log_file"
 }
 
 log_edcopilot_tail() {
@@ -707,6 +777,8 @@ launch_edcopilot_runtime() {
     return 0
   }
 
+  debug_cmd "edcopilot runtime command" "$runtime_client" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=${APPID}" -- "$WINELOADER" "$EDCOPILOT_EXE"
+
   "$runtime_client" \
     --bus-name="$BUS_NAME" \
     --pass-env-matching="WINE*" \
@@ -744,9 +816,12 @@ launch_edcopilot() {
   local waited=0
   local bus_ready="false"
 
+  debug "launch_edcopilot: mode=$mode bus_wait=${EDCOPILOT_BUS_WAIT}s default_bus=$DEFAULT_BUS_NAME runtime_client=${RUNTIME_CLIENT:-<unset>}"
+
   while (( waited < EDCOPILOT_BUS_WAIT )); do
     runtime_client="$(resolve_runtime_client_from_processes || true)"
     resolved_bus="$(discover_runtime_bus_name "$DEFAULT_BUS_NAME" || true)"
+    debug "launch_edcopilot: wait=$waited runtime_candidate=${runtime_client:-<none>} bus_candidate=${resolved_bus:-<none>}"
     if [[ -n "$resolved_bus" ]]; then
       set_var BUS_NAME "$resolved_bus"
       bus_ready="true"
@@ -757,6 +832,7 @@ launch_edcopilot() {
   done
 
   if [[ "$bus_ready" != "true" ]]; then
+    debug "launch_edcopilot: bus not ready after wait loop; retrying one final discovery"
     resolved_bus="$(discover_runtime_bus_name "$DEFAULT_BUS_NAME" || true)"
     if [[ -n "$resolved_bus" ]]; then
       set_var BUS_NAME "$resolved_bus"
@@ -769,12 +845,15 @@ launch_edcopilot() {
     log "Resolved runtime client from running process: $RUNTIME_CLIENT"
   elif [[ -n "${RUNTIME_CLIENT:-}" && -x "$RUNTIME_CLIENT" ]]; then
     log "Falling back to static runtime client: $RUNTIME_CLIENT"
+  else
+    debug "launch_edcopilot: runtime client unavailable"
   fi
 
   if [[ "$mode" == "runtime" || ( "$mode" == "auto" && -n "$RUNTIME_CLIENT" ) ]]; then
     if [[ -x "${RUNTIME_CLIENT:-}" ]]; then
       if [[ "$bus_ready" != "true" ]]; then
         warn "Steam bus '$BUS_NAME' is not available; runtime launch is likely to fail"
+        debug_bus_diagnostics "launch_edcopilot:runtime-without-bus" "$BUS_NAME"
       fi
       launch_edcopilot_runtime "$RUNTIME_CLIENT"
       if [[ $? -eq 0 ]]; then
@@ -828,7 +907,10 @@ launch_tool() {
   local tool_path="$1"
   local label="$2"
 
+  debug "launch_tool: label=$label path=$tool_path no_game_tool_mode=$NO_GAME_TOOL_MODE runtime_ready=${RUNTIME_CLIENT_READY:-false}"
+
   if [[ "$NO_GAME_TOOL_MODE" -eq 1 ]]; then
+    log "Launching tool '$label' via Proton (no-game tool mode)"
     launch_wine_child "$label" "$PROTON_BIN" run "$tool_path"
     return 0
   fi
@@ -838,6 +920,7 @@ launch_tool() {
     resolved_bus="$(discover_runtime_bus_name "$DEFAULT_BUS_NAME" || true)"
     if [[ -n "$resolved_bus" ]]; then
       set_var BUS_NAME "$resolved_bus"
+      log "Launching tool '$label' via Steam runtime bus '$BUS_NAME'"
       launch_wine_child "$label" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- "$WINELOADER" "$tool_path"
       return 0
     fi
@@ -992,6 +1075,7 @@ cfg_assign_select_bool WINESERVER_CLEANUP 'shutdown.wineserver_cleanup' 'false' 
 phase_end "bootstrap"
 
 phase_start "detect steam/prefix/runtime"
+debug "CLI modes: NO_GAME=$NO_GAME WAIT_TOOLS=$WAIT_TOOLS NO_GAME_TOOL_MODE=$NO_GAME_TOOL_MODE DRY_RUN=$DRY_RUN"
 detected_bus_name=""
 set_var STEAM_ROOT "$(cfg_get 'steam.steam_root' '')"
 [[ -z "$STEAM_ROOT" ]] && set_var STEAM_ROOT "$(detect_steam_root || true)"
@@ -1003,6 +1087,7 @@ set_var RUNTIME_CLIENT "$(cfg_get 'steam.runtime_client' '')"
 [[ -z "$RUNTIME_CLIENT" ]] && set_var RUNTIME_CLIENT "$(detect_runtime_client "$STEAM_ROOT" || true)"
 set_var RUNTIME_CLIENT_READY "false"
 if [[ -n "$RUNTIME_CLIENT" && -x "$RUNTIME_CLIENT" ]]; then
+  debug_bus_diagnostics "detect-steam-runtime" "$DEFAULT_BUS_NAME"
   detected_bus_name="$(discover_runtime_bus_name "$DEFAULT_BUS_NAME" || true)"
   if [[ -n "$detected_bus_name" ]]; then
     set_var BUS_NAME "$detected_bus_name"
@@ -1011,6 +1096,9 @@ if [[ -n "$RUNTIME_CLIENT" && -x "$RUNTIME_CLIENT" ]]; then
   else
     warn "Steam runtime bus is not available; using Proton directly"
   fi
+else
+  debug "Runtime client unavailable or not executable: ${RUNTIME_CLIENT:-<unset>}"
+  debug_bus_diagnostics "detect-steam-runtime:no-runtime-client" "$DEFAULT_BUS_NAME"
 fi
 if [[ "$NO_GAME_TOOL_MODE" -eq 1 ]]; then
   set_var RUNTIME_CLIENT_READY "false"
@@ -1160,6 +1248,7 @@ while true; do
       fi
       for t in "${CLI_TOOLS[@]}"; do
         [[ -f "$t" ]] || { warn "tool not found: $t"; continue; }
+        log "Queueing CLI tool launch: $t"
         launch_tool "$t" "tool_$(basename "$t")"
       done
       set_state "STATE_MONITOR"
