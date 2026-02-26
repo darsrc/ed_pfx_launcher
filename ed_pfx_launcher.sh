@@ -23,7 +23,21 @@ _emit_log_line() {
 log() { _emit_log_line "[$(_ts)] $*"; }
 warn() { _emit_log_line "[$(_ts)] WARN: $*"; }
 die() { _emit_log_line "[$(_ts)] ERROR: $*"; exit 1; }
-debug() { [[ "$DEBUG" -eq 1 ]] && log "[DEBUG] $*"; }
+debug() {
+  [[ "$DEBUG" -eq 1 ]] || return 0
+  local line="[$(_ts)] [DEBUG] $*"
+  echo "$line" >> "$LOG_FILE"
+  echo "$line" >&2
+}
+
+ensure_session_bus_env() {
+  if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+    local runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    if [[ -S "$runtime_dir/bus" ]]; then
+      export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus"
+    fi
+  fi
+}
 
 on_error() {
   local line_no="$1" cmd="$2" code="$3"
@@ -393,6 +407,8 @@ is_elite_running() { pgrep -f 'EliteDangerous64\.exe' >/dev/null 2>&1; }
 bus_name_has_owner() {
   local bus_name="$1"
 
+  ensure_session_bus_env
+
   if have gdbus; then
     timeout 2 gdbus call --session \
       --dest org.freedesktop.DBus \
@@ -490,6 +506,8 @@ extract_bus_name_from_command_line() {
 }
 
 list_session_bus_names() {
+  ensure_session_bus_env
+
   if have gdbus; then
     timeout 2 gdbus call --session \
       --dest org.freedesktop.DBus \
@@ -511,9 +529,32 @@ list_session_bus_names() {
   return 1
 }
 
+derive_bus_names_from_appid() {
+  local app_id="$1"
+  [[ "$app_id" =~ ^[0-9]+$ ]] || return 1
+
+  printf '%s\n' "com.steampowered.App$app_id"
+  printf '%s\n' "com.steam.App$app_id"
+  printf '%s\n' "com.valvesoftware.Steam.App$app_id"
+}
+
+extract_appid_candidates_from_process_line() {
+  local process_line="$1"
+  local app_id=""
+
+  app_id="$(printf '%s\n' "$process_line" | sed -n 's/.*SteamGameId=\([0-9]\+\).*/\1/p' | head -n1)"
+  [[ -n "$app_id" ]] && printf '%s\n' "$app_id"
+
+  app_id="$(printf '%s\n' "$process_line" | sed -n 's/.*STEAM_COMPAT_APP_ID=\([0-9]\+\).*/\1/p' | head -n1)"
+  [[ -n "$app_id" ]] && printf '%s\n' "$app_id"
+
+  app_id="$(printf '%s\n' "$process_line" | sed -n 's/.*[Aa]pp\([0-9]\{4,\}\).*/\1/p' | head -n1)"
+  [[ -n "$app_id" ]] && printf '%s\n' "$app_id"
+}
+
 discover_runtime_bus_name() {
   local fallback_bus="$1"
-  local process_line candidate
+  local process_line candidate app_id synthesized_bus
 
   debug_bus_diagnostics "discover_runtime_bus_name:start" "$fallback_bus"
 
@@ -526,7 +567,20 @@ discover_runtime_bus_name() {
       printf '%s' "$candidate"
       return 0
     fi
-  done < <(pgrep -fa 'steam-runtime-launch-client|pressure-vessel' 2>/dev/null || true)
+
+    while IFS= read -r app_id; do
+      [[ -n "$app_id" ]] || continue
+      debug "discover_runtime_bus_name: extracted appid candidate: $app_id"
+      while IFS= read -r synthesized_bus; do
+        debug "discover_runtime_bus_name: checking synthesized bus candidate: $synthesized_bus"
+        if bus_name_has_owner "$synthesized_bus"; then
+          debug "discover_runtime_bus_name: selected synthesized bus: $synthesized_bus"
+          printf '%s' "$synthesized_bus"
+          return 0
+        fi
+      done < <(derive_bus_names_from_appid "$app_id" || true)
+    done < <(extract_appid_candidates_from_process_line "$process_line" || true)
+  done < <(pgrep -fa 'steam-runtime-launch-client|pressure-vessel|SteamGameId=|STEAM_COMPAT_APP_ID=' 2>/dev/null || true)
 
   while IFS= read -r candidate; do
     case "$candidate" in
