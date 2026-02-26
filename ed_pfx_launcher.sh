@@ -1241,8 +1241,7 @@ while true; do
         if [[ "$DRY_RUN" -eq 1 ]]; then
           log "DRY-RUN would launch game command"
         else
-          [[ -n "$GAME_WORKDIR" ]] && cd "$GAME_WORKDIR"
-          "${GAME_CMD_ARR[@]}" &
+          launch_game_process
           set_var GAME_PID "$!"
           register_child "$GAME_PID"
           log "Game process started pid=$GAME_PID"
@@ -1258,7 +1257,7 @@ while true; do
                 GAME_CMD_ARR=("$PROTON_BIN" run "$GAME_EXE_PATH")
                 debug "updated GAME_CMD_ARR fallback to Proton run $GAME_EXE_PATH"
               fi
-              "${GAME_CMD_ARR[@]}" &
+              launch_game_process
               set_var GAME_PID "$!"
               register_child "$GAME_PID"
               log "Game process restarted via Proton pid=$GAME_PID"
