@@ -383,6 +383,34 @@ wait_for_game_window() {
   return 1
 }
 
+wait_for_game_window_or_launcher_exit() {
+  local timeout="$1"
+  local launcher_pid="$2"
+  local launcher_name="$3"
+  local elapsed=0
+  local game_pid=""
+
+  while (( elapsed < timeout )); do
+    game_pid="$(first_pid_for_pattern 'EliteDangerous64\.exe')"
+    if [[ -n "$game_pid" ]]; then
+      set_var DETECTED_KIND "game"
+      set_var DETECTED_PID "$game_pid"
+      log "Detected game process (EliteDangerous64.exe) pid=$DETECTED_PID"
+      return 0
+    fi
+
+    if ! kill -0 "$launcher_pid" >/dev/null 2>&1; then
+      warn "$launcher_name pid=$launcher_pid exited before EliteDangerous64.exe was detected"
+      return 2
+    fi
+
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  return 1
+}
+
 wait_for_launcher() {
   local timeout="$1"
   local elapsed=0
@@ -392,8 +420,12 @@ wait_for_launcher() {
     mined_pid="$(first_pid_for_pattern 'MinEdLauncher')"
     if [[ -n "$mined_pid" ]]; then
       log "Detected MinEdLauncher pid=$mined_pid; waiting for EliteDangerous64.exe"
-      if wait_for_game_window "$GAME_DETECT_TIMEOUT"; then
+      if wait_for_game_window_or_launcher_exit "$GAME_DETECT_TIMEOUT" "$mined_pid" "MinEdLauncher"; then
         return 0
+      fi
+      local wait_status=$?
+      if [[ "$wait_status" -eq 2 ]]; then
+        return 2
       fi
       return 1
     fi
@@ -638,6 +670,7 @@ set_var CURRENT_STATE "STATE_WAIT_LAUNCHER"
 
 declare -a CHILD_PIDS=()
 register_child() { CHILD_PIDS+=("$1"); }
+MINED_FALLBACK_ATTEMPTED=0
 
 cleanup_children() {
   local pid
@@ -982,6 +1015,52 @@ build_mined_launch_cmd() {
   fi
 }
 
+launch_game_process() {
+  local game_log_file="$LOG_DIR/game.log"
+  local launch_dir="${GAME_WORKDIR:-}"
+
+  debug_cmd "game command" "${GAME_CMD_ARR[@]}"
+
+  if [[ -n "$launch_dir" ]]; then
+    (
+      cd "$launch_dir"
+      "${GAME_CMD_ARR[@]}"
+    ) >>"$game_log_file" 2>&1 &
+  else
+    "${GAME_CMD_ARR[@]}" >>"$game_log_file" 2>&1 &
+  fi
+}
+
+
+retry_with_edlaunch_fallback() {
+  local edlaunch_exe
+
+  [[ "$GAME_CMD_KIND" == "mined" ]] || return 1
+  [[ "$MINED_FALLBACK_ATTEMPTED" -eq 0 ]] || return 1
+
+  MINED_FALLBACK_ATTEMPTED=1
+  edlaunch_exe="$(cfg_get 'elite.edlaunch_exe' '')"
+  [[ -z "$edlaunch_exe" ]] && edlaunch_exe="$STEAM_ROOT/steamapps/common/Elite Dangerous/EDLaunch.exe"
+
+  if [[ ! -f "$edlaunch_exe" ]]; then
+    warn "MinEdLauncher launch failed and EDLaunch fallback is unavailable: $edlaunch_exe"
+    return 1
+  fi
+
+  log "MinEdLauncher exited before game start; retrying with EDLaunch.exe"
+  GAME_CMD_KIND="edlaunch"
+  GAME_EXE_PATH="$edlaunch_exe"
+  GAME_WORKDIR="$(dirname "$edlaunch_exe")"
+  build_windows_launch_cmd "$edlaunch_exe"
+  log "Game fallback command=$(format_cmd_for_log "${GAME_CMD_ARR[@]}")"
+
+  launch_game_process
+  set_var GAME_PID "$!"
+  register_child "$GAME_PID"
+  log "Game process restarted via EDLaunch fallback pid=$GAME_PID"
+  return 0
+}
+
 launch_tool() {
   local tool_path="$1"
   local label="$2"
@@ -1274,6 +1353,11 @@ while true; do
         log "Skipping wait for game in no-game/dry-run"
       else
         if ! wait_for_launcher "$LAUNCHER_DETECT_TIMEOUT"; then
+          wait_status=$?
+          if [[ "$wait_status" -eq 2 ]] && retry_with_edlaunch_fallback; then
+            phase_end "STATE_WAIT_GAME"
+            continue
+          fi
           phase_fail "STATE_WAIT_GAME" "launcher/game detection timeout"
           die "Launcher detection timed out after ${LAUNCHER_DETECT_TIMEOUT}s or game detection timed out after ${GAME_DETECT_TIMEOUT}s"
         fi
