@@ -90,19 +90,21 @@ NO_GAME=0
 WAIT_TOOLS=0
 DRY_RUN=0
 SELF_TEST=0
+PRINT_RESOLVED=0
 DEBUG=0
 declare -a CLI_TOOLS=()
 declare -a FORWARDED_CMD=()
 declare -a MINED_ARGS_ARR=()
 NO_GAME_TOOL_MODE=0
 STEAM_MODE=0
+FRONTIER_ACTIVE=0
 PASS_COMMAND="false"
 PASS_COMMAND_EXPLICIT="false"
 
 usage() {
   cat <<USAGE
 Usage:
-  $SCRIPT_NAME [--config <ini>] [--no-game] [--wait-tools] [--tool <exe>]... [--dry-run] [--self-test] [--pass-command|--no-pass-command] [--debug] [--] %command%
+  $SCRIPT_NAME [--config <ini>] [--no-game] [--wait-tools] [--tool <exe>]... [--dry-run] [--print-resolved] [--self-test] [--pass-command|--no-pass-command] [--debug] [--] %command%
 USAGE
 }
 
@@ -113,6 +115,7 @@ while [[ $# -gt 0 ]]; do
     --no-game) NO_GAME=1; shift;;
     --wait-tools) WAIT_TOOLS=1; shift;;
     --dry-run) DRY_RUN=1; shift;;
+    --print-resolved) PRINT_RESOLVED=1; shift;;
     --self-test) SELF_TEST=1; shift;;
     --pass-command) PASS_COMMAND="true"; PASS_COMMAND_EXPLICIT="true"; shift;;
     --no-pass-command) PASS_COMMAND="false"; PASS_COMMAND_EXPLICIT="true"; shift;;
@@ -932,12 +935,34 @@ launch_edcopilot_runtime() {
   return 1
 }
 
+is_edcopilot_cli_duplicate() {
+  local tool_path="$1"
+  local tool_real="" ed_real=""
+
+  [[ "$EDCOPILOT_ENABLED" == "true" ]] || return 1
+
+  tool_real="$(realpath -m "$tool_path" 2>/dev/null || true)"
+  ed_real="$(realpath -m "$EDCOPILOT_EXE" 2>/dev/null || true)"
+
+  if [[ -n "$tool_real" && -n "$ed_real" && "$tool_real" == "$ed_real" ]]; then
+    return 0
+  fi
+
+  [[ "$tool_path" == */EDCoPilot/LaunchEDCoPilot.exe ]]
+}
+
 launch_edcopilot() {
   local mode="$1" runtime_client="" resolved_bus=""
   local waited=0
   local bus_ready="false"
 
   debug "launch_edcopilot: mode=$mode bus_wait=${EDCOPILOT_BUS_WAIT}s default_bus=$DEFAULT_BUS_NAME runtime_client=${RUNTIME_CLIENT:-<unset>}"
+
+  if [[ "$mode" != "runtime" ]]; then
+    log "Launching EDCoPilot via Proton fallback"
+    launch_wine_child "edcopilot" "$PROTON_BIN" run "$EDCOPILOT_EXE"
+    return 0
+  fi
 
   while (( waited < EDCOPILOT_BUS_WAIT )); do
     runtime_client="$(resolve_runtime_client_from_processes || true)"
@@ -970,34 +995,17 @@ launch_edcopilot() {
     debug "launch_edcopilot: runtime client unavailable"
   fi
 
-  if [[ "$mode" == "runtime" || ( "$mode" == "auto" && -n "$RUNTIME_CLIENT" ) ]]; then
-    if [[ -x "${RUNTIME_CLIENT:-}" ]]; then
-      if [[ "$bus_ready" != "true" ]]; then
-        warn "Steam bus '$BUS_NAME' is not available; runtime launch is likely to fail"
-        debug_bus_diagnostics "launch_edcopilot:runtime-without-bus" "$BUS_NAME"
-      fi
-      launch_edcopilot_runtime "$RUNTIME_CLIENT"
-      if [[ $? -eq 0 ]]; then
-        return 0
-      fi
-
-      if [[ "$bus_ready" != "true" && "$EDCOPILOT_ALLOW_PROTON_FALLBACK" == "true" ]]; then
-        log "Retrying EDCoPilot via Proton fallback because Steam bus '$BUS_NAME' is unavailable"
-        launch_wine_child "edcopilot" "$PROTON_BIN" run "$EDCOPILOT_EXE"
-        return 0
-      fi
-
-      return 1
-    fi
+  if [[ "$bus_ready" != "true" ]]; then
+    warn "Steam runtime bus not present; runtime mode requires Steam. Use mode=wine for steamless."
+    return 1
   fi
 
-  if [[ "$EDCOPILOT_ALLOW_PROTON_FALLBACK" == "true" ]]; then
-    log "Launching EDCoPilot via Proton fallback"
-    launch_wine_child "edcopilot" "$PROTON_BIN" run "$EDCOPILOT_EXE"
-    return 0
+  if [[ -x "${RUNTIME_CLIENT:-}" ]]; then
+    launch_edcopilot_runtime "$RUNTIME_CLIENT"
+    return $?
   fi
 
-  warn "No runtime launch path available and Proton fallback is disabled"
+  warn "Steam runtime client unavailable; runtime mode requires Steam."
   return 1
 }
 
@@ -1192,6 +1200,7 @@ build_game_command() {
   GAME_WORKDIR=""
   GAME_EXE_PATH=""
   GAME_CMD_ARR=()
+  FRONTIER_ACTIVE=0
 
   MINED_ARGS_ARR=()
   if [[ -n "$ELITE_MINED_FLAGS" ]]; then
@@ -1201,18 +1210,29 @@ build_game_command() {
     IFS="$old_ifs"
   fi
 
-  if [[ -n "$ELITE_PROFILE" ]]; then
-    local have_frontier=0 arg
-    for arg in "${MINED_ARGS_ARR[@]}"; do
-      if [[ "$arg" == "/frontier" ]]; then
-        have_frontier=1
-        break
-      fi
-    done
-
-    if [[ "$have_frontier" -eq 0 ]]; then
-      MINED_ARGS_ARR=("/frontier" "$ELITE_PROFILE" "${MINED_ARGS_ARR[@]}")
+  local have_frontier=0 arg
+  for arg in "${MINED_ARGS_ARR[@]}"; do
+    if [[ "$arg" == "/frontier" ]]; then
+      have_frontier=1
+      break
     fi
+  done
+
+  if [[ "$ELITE_PLATFORM" == "frontier" ]]; then
+    if [[ -z "$ELITE_PROFILE" && "$have_frontier" -eq 0 ]]; then
+      die "Frontier mode requires elite.profile or /frontier in mined_flags; otherwise MinEdLauncher will try Steam auth and crash."
+    fi
+    if [[ -n "$ELITE_PROFILE" && "$have_frontier" -eq 0 ]]; then
+      MINED_ARGS_ARR=("/frontier" "$ELITE_PROFILE" "${MINED_ARGS_ARR[@]}")
+      have_frontier=1
+    fi
+  elif [[ -n "$ELITE_PROFILE" && "$have_frontier" -eq 0 ]]; then
+    MINED_ARGS_ARR=("/frontier" "$ELITE_PROFILE" "${MINED_ARGS_ARR[@]}")
+    have_frontier=1
+  fi
+
+  if [[ "$have_frontier" -eq 1 ]]; then
+    FRONTIER_ACTIVE=1
   fi
 
   STEAM_MODE=0
@@ -1339,6 +1359,12 @@ else
   PASS_COMMAND="false"
   CFG_SOURCE['elite.pass_command']="default"
 fi
+ELITE_PLATFORM="$(cfg_get 'elite.platform' 'frontier')"
+ELITE_PLATFORM="${ELITE_PLATFORM,,}"
+case "$ELITE_PLATFORM" in
+  frontier|steam) ;;
+  *) warn "Invalid elite.platform='$ELITE_PLATFORM'; defaulting to frontier"; ELITE_PLATFORM="frontier";;
+esac
 ELITE_PROFILE="$(cfg_get 'elite.profile' '')"
 ELITE_MINED_FLAGS="$(cfg_get 'elite.mined_flags' '/autorun /autoquit /edo')"
 EDCOPILOT_EXE_REL="$(cfg_get 'edcopilot.exe_rel' 'drive_c/EDCoPilot/LaunchEDCoPilot.exe')"
@@ -1404,7 +1430,12 @@ else
   warn "Invalid audio.pulse_latency_msec='$PULSE_LATENCY_MSEC'; using 90"
   export PULSE_LATENCY_MSEC="90"
 fi
-export WINEPREFIX STEAM_COMPAT_DATA_PATH="$COMPATDATA_DIR" STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT" SteamGameId="$APPID" WINEDEBUG="-all"
+if [[ "${FRONTIER_ACTIVE:-0}" -eq 1 || "$ELITE_PLATFORM" == "frontier" ]]; then
+  unset SteamGameId SteamAppId
+  export WINEPREFIX STEAM_COMPAT_DATA_PATH="$COMPATDATA_DIR" STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT" WINEDEBUG="-all"
+else
+  export WINEPREFIX STEAM_COMPAT_DATA_PATH="$COMPATDATA_DIR" STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT" SteamGameId="$APPID" WINEDEBUG="-all"
+fi
 log_effective_config
 phase_end "detect steam/prefix/runtime"
 
@@ -1419,8 +1450,15 @@ else
 fi
 phase_end "detect launcher/game"
 
+if [[ "$PRINT_RESOLVED" -eq 1 ]]; then
+  log "Resolved frontier_active=$FRONTIER_ACTIVE"
+  log "Resolved game command=$(format_cmd_for_log "${GAME_CMD_ARR[@]}")"
+  exit 0
+fi
+
 if [[ "$DRY_RUN" -eq 1 ]]; then
   log "DRY-RUN resolved game command=$(format_cmd_for_log "${GAME_CMD_ARR[@]}")"
+  log "DRY-RUN frontier_active=$FRONTIER_ACTIVE"
   log "DRY-RUN exiting before launching processes"
   exit 0
 fi
@@ -1549,6 +1587,10 @@ while true; do
       fi
       for t in "${CLI_TOOLS[@]}"; do
         [[ -f "$t" ]] || { warn "tool not found: $t"; continue; }
+        if is_edcopilot_cli_duplicate "$t"; then
+          warn "Skipping duplicate EDCoPilot CLI tool; edcopilot.enabled already launches it."
+          continue
+        fi
         log "Queueing CLI tool launch: $t"
         launch_tool "$t" "tool_$(basename "$t")"
       done
