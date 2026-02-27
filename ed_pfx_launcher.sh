@@ -89,6 +89,7 @@ CONFIG_PATH="$SCRIPT_DIR/ed_pfx_launcher.ini"
 NO_GAME=0
 WAIT_TOOLS=0
 DRY_RUN=0
+SELF_TEST=0
 DEBUG=0
 declare -a CLI_TOOLS=()
 declare -a FORWARDED_CMD=()
@@ -101,7 +102,7 @@ PASS_COMMAND_EXPLICIT="false"
 usage() {
   cat <<USAGE
 Usage:
-  $SCRIPT_NAME [--config <ini>] [--no-game] [--wait-tools] [--tool <exe>]... [--dry-run] [--pass-command|--no-pass-command] [--debug] [--] %command%
+  $SCRIPT_NAME [--config <ini>] [--no-game] [--wait-tools] [--tool <exe>]... [--dry-run] [--self-test] [--pass-command|--no-pass-command] [--debug] [--] %command%
 USAGE
 }
 
@@ -112,6 +113,7 @@ while [[ $# -gt 0 ]]; do
     --no-game) NO_GAME=1; shift;;
     --wait-tools) WAIT_TOOLS=1; shift;;
     --dry-run) DRY_RUN=1; shift;;
+    --self-test) SELF_TEST=1; shift;;
     --pass-command) PASS_COMMAND="true"; PASS_COMMAND_EXPLICIT="true"; shift;;
     --no-pass-command) PASS_COMMAND="false"; PASS_COMMAND_EXPLICIT="true"; shift;;
     --debug|--degbug) DEBUG=1; shift;;
@@ -396,6 +398,7 @@ wait_for_game_window_or_launcher_exit() {
   local launcher_name="$3"
   local elapsed=0
   local game_pid=""
+  local launcher_exited_early="false"
 
   while (( elapsed < timeout )); do
     game_pid="$(first_pid_for_pattern 'EliteDangerous64\.exe')"
@@ -406,14 +409,18 @@ wait_for_game_window_or_launcher_exit() {
       return 0
     fi
 
-    if ! kill -0 "$launcher_pid" >/dev/null 2>&1; then
-      warn "$launcher_name pid=$launcher_pid exited before EliteDangerous64.exe was detected"
-      return 2
+    if [[ "$launcher_exited_early" != "true" ]] && ! kill -0 "$launcher_pid" >/dev/null 2>&1; then
+      launcher_exited_early="true"
+      warn "$launcher_name pid=$launcher_pid exited before EliteDangerous64.exe was detected; continuing to wait"
     fi
 
     sleep 1
     elapsed=$((elapsed + 1))
   done
+
+  if [[ "$launcher_exited_early" == "true" ]]; then
+    return 2
+  fi
 
   return 1
 }
@@ -1029,7 +1036,10 @@ build_mined_launch_cmd() {
     pass_command_effective="true"
   fi
 
-  if [[ -n "$mined_native" ]]; then
+  # DRY-RUN scenario notes:
+  # - Terminal mode (Steam mode=0) should resolve to Proton/runtime + MinEdLauncher.exe, never native MinEdLauncher.
+  # - Steam mode (Steam mode=1) may resolve to native MinEdLauncher, and may prepend forwarded %command% tokens.
+  if [[ "$STEAM_MODE" -eq 1 && -n "$mined_native" ]]; then
     # MinEdLauncher contract: %command% tokens (optional) must come before MinEd flags.
     GAME_CMD_ARR=("$mined_native")
     if [[ "$STEAM_MODE" -eq 1 && "$pass_command_effective" == "true" && ${#FORWARDED_CMD[@]} -gt 0 ]]; then
@@ -1130,6 +1140,51 @@ launch_tool() {
   fi
 
   launch_wine_child "$label" "$PROTON_BIN" run "$tool_path"
+}
+
+
+run_self_test() {
+  local mined_exe terminal_cmd steam_cmd
+  local saved_steam_mode="$STEAM_MODE"
+  local saved_proton_bin="${PROTON_BIN:-}"
+  local saved_runtime_ready="${RUNTIME_CLIENT_READY:-false}"
+  local saved_runtime_client="${RUNTIME_CLIENT:-}"
+  local saved_wineloader="${WINELOADER:-}"
+  local saved_bus_name="${BUS_NAME:-}"
+  local saved_appid="${APPID:-}"
+  local -a saved_forwarded_cmd=("${FORWARDED_CMD[@]}")
+
+  mined_exe="$(cfg_get 'elite.mined_exe' '')"
+  [[ -z "$mined_exe" ]] && mined_exe="./MinEdLauncher.exe"
+
+  PROTON_BIN="${PROTON_BIN:-proton}"
+  RUNTIME_CLIENT_READY="false"
+  RUNTIME_CLIENT="${RUNTIME_CLIENT:-steam-runtime-launch-client}"
+  WINELOADER="${WINELOADER:-wine}"
+  BUS_NAME="${BUS_NAME:-com.steampowered.App359320}"
+  APPID="${APPID:-359320}"
+
+  STEAM_MODE=0
+  FORWARDED_CMD=()
+  build_mined_launch_cmd "$mined_exe"
+  terminal_cmd="$(format_cmd_for_log "${GAME_CMD_ARR[@]}")"
+
+  STEAM_MODE=1
+  FORWARDED_CMD=("pressure-vessel" "--simulate")
+  build_mined_launch_cmd "$mined_exe"
+  steam_cmd="$(format_cmd_for_log "${GAME_CMD_ARR[@]}")"
+
+  STEAM_MODE="$saved_steam_mode"
+  PROTON_BIN="$saved_proton_bin"
+  RUNTIME_CLIENT_READY="$saved_runtime_ready"
+  RUNTIME_CLIENT="$saved_runtime_client"
+  WINELOADER="$saved_wineloader"
+  BUS_NAME="$saved_bus_name"
+  APPID="$saved_appid"
+  FORWARDED_CMD=("${saved_forwarded_cmd[@]}")
+
+  printf "SELF-TEST terminal-mode command: %s\n" "$terminal_cmd"
+  printf "SELF-TEST steam-mode command: %s\n" "$steam_cmd"
 }
 
 build_game_command() {
@@ -1249,6 +1304,11 @@ build_game_command() {
 
 ini_load "$CONFIG_PATH"
 log_loaded_config
+
+if [[ "$SELF_TEST" -eq 1 ]]; then
+  run_self_test
+  exit 0
+fi
 
 if [[ "$NO_GAME" -eq 1 && ${#CLI_TOOLS[@]} -gt 0 ]]; then
   set_var NO_GAME_TOOL_MODE "1"
