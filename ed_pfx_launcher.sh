@@ -892,16 +892,47 @@ PY
   done
 }
 
+build_edcopilot_winedlloverrides() {
+  local required="dinput=n;dinput8=n;hid=n;hidraw=n"
+  local existing="${WINEDLLOVERRIDES:-}"
+
+  if [[ -z "$existing" ]]; then
+    printf '%s' "$required"
+  elif [[ "$existing" == *"$required"* ]]; then
+    printf '%s' "$existing"
+  else
+    printf '%s;%s' "$required" "$existing"
+  fi
+}
+
+build_edcopilot_env_args() {
+  local merged_overrides=""
+  local default_winedebug='-all,+seh,+err,+mscoree,+loaddll'
+
+  EDCOPILOT_ENV_ARGS=(
+    "WINEPREFIX=$WINEPREFIX"
+    "WINEFSYNC=1"
+    "WINEESYNC=1"
+    "SDL_JOYSTICK_DISABLE=1"
+    "SDL_GAMECONTROLLER_DISABLE=1"
+    "PYGAME_FORCE_JOYSTICK=0"
+  )
+
+  merged_overrides="$(build_edcopilot_winedlloverrides)"
+  EDCOPILOT_ENV_ARGS+=("WINEDLLOVERRIDES=$merged_overrides")
+
+  if [[ -z "${WINEDEBUG+x}" ]]; then
+    EDCOPILOT_ENV_ARGS+=("WINEDEBUG=$default_winedebug")
+  fi
+}
+
 launch_edcopilot_runtime() {
   local runtime_client="$1"
   local log_file="$LOG_DIR/edcopilot.log"
   local pid=""
   local elapsed=0
-  local -a edcopilot_cmd=("$WINELOADER" "$EDCOPILOT_EXE")
-
-  if [[ "$EDCOPILOT_DISABLE_SDL_JOYSTICK" == "true" ]]; then
-    edcopilot_cmd=(env SDL_JOYSTICK_DISABLE=1 SDL_GAMECONTROLLER_DISABLE=1 PYGAME_FORCE_JOYSTICK=0 "${edcopilot_cmd[@]}")
-  fi
+  build_edcopilot_env_args
+  local -a edcopilot_cmd=(env "${EDCOPILOT_ENV_ARGS[@]}" "$WINELOADER" "$EDCOPILOT_EXE")
 
   [[ "$DRY_RUN" -eq 1 ]] && {
     log "DRY-RUN child[edcopilot]: $runtime_client --bus-name=\"com.steampowered.App${APPID}\" --pass-env-matching=\"WINE*\" --pass-env-matching=\"STEAM*\" --pass-env-matching=\"PROTON*\" --env=\"SteamGameId=${APPID}\" -- \"$WINELOADER\" \"$EDCOPILOT_EXE\""
@@ -951,11 +982,20 @@ is_edcopilot_cli_duplicate() {
   tool_real="$(realpath -m "$tool_path" 2>/dev/null || true)"
   ed_real="$(realpath -m "$EDCOPILOT_EXE" 2>/dev/null || true)"
 
-  if [[ -n "$tool_real" && -n "$ed_real" && "$tool_real" == "$ed_real" ]]; then
-    return 0
-  fi
+  [[ -n "$tool_real" && -n "$ed_real" && "$tool_real" == "$ed_real" ]]
+}
 
-  [[ "$(basename "$tool_path")" == "LaunchEDCoPilot.exe" ]] || [[ "$tool_path" == */EDCoPilot/LaunchEDCoPilot.exe* ]]
+is_edcopilot_tool_binary() {
+  local tool_path="$1"
+  local tool_name
+
+  tool_name="$(basename "$tool_path")"
+  case "${tool_name,,}" in
+    edcopilot.exe|edcopilotgui2.exe|launchedcopilot.exe)
+      return 0
+      ;;
+  esac
+  return 1
 }
 
 apply_edcopilot_hotas_fix() {
@@ -971,11 +1011,6 @@ launch_edcopilot() {
   local waited=0
   local bus_ready="false"
   local log_file="$LOG_DIR/edcopilot.log"
-  local -a proton_cmd=("$PROTON_BIN" run "$EDCOPILOT_EXE")
-
-  if [[ "$EDCOPILOT_DISABLE_SDL_JOYSTICK" == "true" ]]; then
-    proton_cmd=(env SDL_JOYSTICK_DISABLE=1 SDL_GAMECONTROLLER_DISABLE=1 PYGAME_FORCE_JOYSTICK=0 "${proton_cmd[@]}")
-  fi
 
   : > "$log_file" || true
   apply_edcopilot_hotas_fix
@@ -983,8 +1018,9 @@ launch_edcopilot() {
   debug "launch_edcopilot: mode=$mode bus_wait=${EDCOPILOT_BUS_WAIT}s default_bus=$DEFAULT_BUS_NAME runtime_client=${RUNTIME_CLIENT:-<unset>}"
 
   if [[ "$mode" == "wine" ]]; then
-    log "Launching EDCoPilot via Proton fallback"
-    launch_wine_child "edcopilot" "${proton_cmd[@]}"
+    log "Launching EDCoPilot via Proton wine loader"
+    build_edcopilot_env_args
+    launch_wine_child "edcopilot" env "${EDCOPILOT_ENV_ARGS[@]}" "$WINELOADER" "$EDCOPILOT_EXE"
     return 0
   fi
 
@@ -1025,8 +1061,9 @@ launch_edcopilot() {
 
   if [[ "$bus_ready" != "true" ]]; then
     if [[ "$mode" == "auto" ]]; then
-      warn "Steam runtime bus not present; auto mode falling back to Proton"
-      launch_wine_child "edcopilot" "${proton_cmd[@]}"
+      warn "Steam runtime bus not present; auto mode falling back to Proton wine loader"
+      build_edcopilot_env_args
+      launch_wine_child "edcopilot" env "${EDCOPILOT_ENV_ARGS[@]}" "$WINELOADER" "$EDCOPILOT_EXE"
       return 0
     fi
     warn "Steam runtime bus not present; runtime mode requires Steam. Use mode=wine for steamless."
@@ -1039,8 +1076,9 @@ launch_edcopilot() {
   fi
 
   if [[ "$mode" == "auto" ]]; then
-    warn "Steam runtime client unavailable; auto mode falling back to Proton"
-    launch_wine_child "edcopilot" "${proton_cmd[@]}"
+    warn "Steam runtime client unavailable; auto mode falling back to Proton wine loader"
+    build_edcopilot_env_args
+    launch_wine_child "edcopilot" env "${EDCOPILOT_ENV_ARGS[@]}" "$WINELOADER" "$EDCOPILOT_EXE"
     return 0
   fi
 
@@ -1169,8 +1207,14 @@ launch_tool() {
   debug "launch_tool: label=$label path=$tool_path no_game_tool_mode=$NO_GAME_TOOL_MODE runtime_ready=${RUNTIME_CLIENT_READY:-false}"
 
   if [[ "$NO_GAME_TOOL_MODE" -eq 1 ]]; then
-    log "Launching tool '$label' via Proton (no-game tool mode)"
-    launch_wine_child "$label" "$PROTON_BIN" run "$tool_path"
+    if is_edcopilot_tool_binary "$tool_path"; then
+      log "Launching tool '$label' via Proton wine loader (EDCoPilot binary)"
+      build_edcopilot_env_args
+      launch_wine_child "$label" env "${EDCOPILOT_ENV_ARGS[@]}" "$WINELOADER" "$tool_path"
+    else
+      log "Launching tool '$label' via Proton (no-game tool mode)"
+      launch_wine_child "$label" "$PROTON_BIN" run "$tool_path"
+    fi
     return 0
   fi
 
@@ -1180,13 +1224,24 @@ launch_tool() {
     if [[ -n "$resolved_bus" ]]; then
       set_var BUS_NAME "$resolved_bus"
       log "Launching tool '$label' via Steam runtime bus '$BUS_NAME'"
-      launch_wine_child "$label" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- "$WINELOADER" "$tool_path"
+      if is_edcopilot_tool_binary "$tool_path"; then
+        build_edcopilot_env_args
+        launch_wine_child "$label" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- env "${EDCOPILOT_ENV_ARGS[@]}" "$WINELOADER" "$tool_path"
+      else
+        launch_wine_child "$label" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- "$WINELOADER" "$tool_path"
+      fi
       return 0
     fi
     warn "Steam runtime bus could not be detected for tool '$label'; falling back to Proton"
   fi
 
-  launch_wine_child "$label" "$PROTON_BIN" run "$tool_path"
+  if is_edcopilot_tool_binary "$tool_path"; then
+    log "Launching tool '$label' via Proton wine loader (EDCoPilot binary fallback)"
+    build_edcopilot_env_args
+    launch_wine_child "$label" env "${EDCOPILOT_ENV_ARGS[@]}" "$WINELOADER" "$tool_path"
+  else
+    launch_wine_child "$label" "$PROTON_BIN" run "$tool_path"
+  fi
 }
 
 
@@ -1629,7 +1684,7 @@ while true; do
       for t in "${CLI_TOOLS[@]}"; do
         [[ -f "$t" ]] || { warn "tool not found: $t"; continue; }
         if is_edcopilot_cli_duplicate "$t"; then
-          warn "Skipping duplicate EDCoPilot tool; edcopilot.enabled already handles it."
+          debug "Skipping duplicate EDCoPilot tool launch (same realpath as EDCOPILOT_EXE): $t"
           continue
         fi
         log "Queueing CLI tool launch: $t"
