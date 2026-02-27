@@ -295,6 +295,8 @@ log_effective_config() {
   log "  edcopilot.bus_wait=$EDCOPILOT_BUS_WAIT source=$(cfg_source_or_unknown 'edcopilot.bus_wait')"
   log "  edcopilot.init_timeout=$EDCOPILOT_INIT_TIMEOUT source=$(cfg_source_or_unknown 'edcopilot.init_timeout')"
   log "  edcopilot.graceful_shutdown_timeout=$EDCOPILOT_SHUTDOWN_TIMEOUT source=$(cfg_source_or_unknown 'edcopilot.graceful_shutdown_timeout')"
+  log "  edcopilot.hotas_fix=$EDCOPILOT_HOTAS_FIX source=$(cfg_source_or_unknown 'edcopilot.hotas_fix')"
+  log "  edcopilot.disable_sdl_joystick=$EDCOPILOT_DISABLE_SDL_JOYSTICK source=$(cfg_source_or_unknown 'edcopilot.disable_sdl_joystick')"
   log "  shutdown.monitor_target=$SHUTDOWN_MONITOR_TARGET source=$(cfg_source_or_unknown 'shutdown.monitor_target')"
   log "  shutdown.close_tools_with_game=$CLOSE_TOOLS_ON_SHUTDOWN source=$(cfg_source_or_unknown 'shutdown.close_tools_with_game')"
   log "  shutdown.wineserver_cleanup=$WINESERVER_CLEANUP source=$(cfg_source_or_unknown 'shutdown.wineserver_cleanup')"
@@ -895,13 +897,18 @@ launch_edcopilot_runtime() {
   local log_file="$LOG_DIR/edcopilot.log"
   local pid=""
   local elapsed=0
+  local -a edcopilot_cmd=("$WINELOADER" "$EDCOPILOT_EXE")
+
+  if [[ "$EDCOPILOT_DISABLE_SDL_JOYSTICK" == "true" ]]; then
+    edcopilot_cmd=(env SDL_JOYSTICK_DISABLE=1 SDL_GAMECONTROLLER_DISABLE=1 PYGAME_FORCE_JOYSTICK=0 "${edcopilot_cmd[@]}")
+  fi
 
   [[ "$DRY_RUN" -eq 1 ]] && {
     log "DRY-RUN child[edcopilot]: $runtime_client --bus-name=\"com.steampowered.App${APPID}\" --pass-env-matching=\"WINE*\" --pass-env-matching=\"STEAM*\" --pass-env-matching=\"PROTON*\" --env=\"SteamGameId=${APPID}\" -- \"$WINELOADER\" \"$EDCOPILOT_EXE\""
     return 0
   }
 
-  debug_cmd "edcopilot runtime command" "$runtime_client" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=${APPID}" -- "$WINELOADER" "$EDCOPILOT_EXE"
+  debug_cmd "edcopilot runtime command" "$runtime_client" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=${APPID}" -- "${edcopilot_cmd[@]}"
 
   "$runtime_client" \
     --bus-name="$BUS_NAME" \
@@ -909,7 +916,7 @@ launch_edcopilot_runtime() {
     --pass-env-matching="STEAM*" \
     --pass-env-matching="PROTON*" \
     --env="SteamGameId=${APPID}" \
-    -- "$WINELOADER" "$EDCOPILOT_EXE" >>"$log_file" 2>&1 &
+    -- "${edcopilot_cmd[@]}" >>"$log_file" 2>&1 &
   pid="$!"
   register_child "$pid"
   log "Started EDCoPilot runtime launch pid=$pid"
@@ -948,20 +955,41 @@ is_edcopilot_cli_duplicate() {
     return 0
   fi
 
-  [[ "$tool_path" == */EDCoPilot/LaunchEDCoPilot.exe ]]
+  [[ "$(basename "$tool_path")" == "LaunchEDCoPilot.exe" ]] || [[ "$tool_path" == */EDCoPilot/LaunchEDCoPilot.exe* ]]
+}
+
+apply_edcopilot_hotas_fix() {
+  [[ "$EDCOPILOT_HOTAS_FIX" == "true" ]] || return 0
+
+  debug_cmd "edcopilot hotas fix registry" "$WINELOADER" reg add 'HKCU\\Software\\Wine\\DllOverrides' /v windows.gaming.input /t REG_SZ /d '' /f
+  "$WINELOADER" reg add 'HKCU\Software\Wine\DllOverrides' /v windows.gaming.input /t REG_SZ /d '' /f >/dev/null 2>&1 \
+    || warn "Failed to apply EDCoPilot HOTAS registry override"
 }
 
 launch_edcopilot() {
   local mode="$1" runtime_client="" resolved_bus=""
   local waited=0
   local bus_ready="false"
+  local log_file="$LOG_DIR/edcopilot.log"
+  local -a proton_cmd=("$PROTON_BIN" run "$EDCOPILOT_EXE")
+
+  if [[ "$EDCOPILOT_DISABLE_SDL_JOYSTICK" == "true" ]]; then
+    proton_cmd=(env SDL_JOYSTICK_DISABLE=1 SDL_GAMECONTROLLER_DISABLE=1 PYGAME_FORCE_JOYSTICK=0 "${proton_cmd[@]}")
+  fi
+
+  : > "$log_file" || true
+  apply_edcopilot_hotas_fix
 
   debug "launch_edcopilot: mode=$mode bus_wait=${EDCOPILOT_BUS_WAIT}s default_bus=$DEFAULT_BUS_NAME runtime_client=${RUNTIME_CLIENT:-<unset>}"
 
-  if [[ "$mode" != "runtime" ]]; then
+  if [[ "$mode" == "wine" ]]; then
     log "Launching EDCoPilot via Proton fallback"
-    launch_wine_child "edcopilot" "$PROTON_BIN" run "$EDCOPILOT_EXE"
+    launch_wine_child "edcopilot" "${proton_cmd[@]}"
     return 0
+  fi
+
+  if [[ "$mode" != "runtime" && "$mode" != "auto" ]]; then
+    warn "Unknown edcopilot.mode '$mode'; defaulting to runtime behavior"
   fi
 
   while (( waited < EDCOPILOT_BUS_WAIT )); do
@@ -996,6 +1024,11 @@ launch_edcopilot() {
   fi
 
   if [[ "$bus_ready" != "true" ]]; then
+    if [[ "$mode" == "auto" ]]; then
+      warn "Steam runtime bus not present; auto mode falling back to Proton"
+      launch_wine_child "edcopilot" "${proton_cmd[@]}"
+      return 0
+    fi
     warn "Steam runtime bus not present; runtime mode requires Steam. Use mode=wine for steamless."
     return 1
   fi
@@ -1003,6 +1036,12 @@ launch_edcopilot() {
   if [[ -x "${RUNTIME_CLIENT:-}" ]]; then
     launch_edcopilot_runtime "$RUNTIME_CLIENT"
     return $?
+  fi
+
+  if [[ "$mode" == "auto" ]]; then
+    warn "Steam runtime client unavailable; auto mode falling back to Proton"
+    launch_wine_child "edcopilot" "${proton_cmd[@]}"
+    return 0
   fi
 
   warn "Steam runtime client unavailable; runtime mode requires Steam."
@@ -1340,6 +1379,8 @@ set_var BUS_NAME "com.steampowered.App$APPID"
 set_var DEFAULT_BUS_NAME "$BUS_NAME"
 cfg_assign_select_bool EDCOPILOT_ENABLED 'edcopilot.enabled' 'true' 'edcopilot.enabled'
 cfg_assign_select EDCOPILOT_MODE 'edcopilot.mode' 'runtime' 'edcopilot.mode'
+cfg_assign_select_bool EDCOPILOT_HOTAS_FIX 'edcopilot.hotas_fix' 'true' 'edcopilot.hotas_fix'
+cfg_assign_select_bool EDCOPILOT_DISABLE_SDL_JOYSTICK 'edcopilot.disable_sdl_joystick' 'true' 'edcopilot.disable_sdl_joystick'
 cfg_assign_select_int EDCOPILOT_DELAY 'edcopilot.startup_delay' '30' '0' 'edcopilot.startup_delay' 'edcopilot.delay'
 cfg_assign_select_int EDCOPILOT_BUS_WAIT 'edcopilot.bus_wait' '30' '0' 'edcopilot.bus_wait'
 cfg_assign_select_int EDCOPILOT_INIT_TIMEOUT 'edcopilot.init_timeout' '45' '1' 'edcopilot.init_timeout'
@@ -1588,7 +1629,7 @@ while true; do
       for t in "${CLI_TOOLS[@]}"; do
         [[ -f "$t" ]] || { warn "tool not found: $t"; continue; }
         if is_edcopilot_cli_duplicate "$t"; then
-          warn "Skipping duplicate EDCoPilot CLI tool; edcopilot.enabled already launches it."
+          warn "Skipping duplicate EDCoPilot tool; edcopilot.enabled already handles it."
           continue
         fi
         log "Queueing CLI tool launch: $t"
