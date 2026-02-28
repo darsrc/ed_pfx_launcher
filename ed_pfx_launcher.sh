@@ -599,22 +599,77 @@ pick_one() {
 }
 
 render_interactive_menu() {
-  local label="$1" selected="$2"
-  shift 2
-  local -a choices=("$@")
-  local idx
+  local -n state_ref="$1"
+  local -a steps=("Detect" "Select Prefix" "Select Proton" "Review" "Save")
+  local -a prefix_candidates=()
+  local -a proton_candidates=()
+  local active_step="${state_ref[active_step]:-0}"
+  local focus="${state_ref[focus]:-main}"
+  local idx marker
 
-  printf '\r\033[J'
-  printf '%s\n' "$label"
-  printf '  Use ↑/↓ (or j/k), Enter to confirm, q to cancel.\n\n'
+  [[ -n "${state_ref[prefix_candidates]:-}" ]] && IFS=$'\n' read -r -d '' -a prefix_candidates < <(printf '%s\0' "${state_ref[prefix_candidates]}")
+  [[ -n "${state_ref[proton_candidates]:-}" ]] && IFS=$'\n' read -r -d '' -a proton_candidates < <(printf '%s\0' "${state_ref[proton_candidates]}")
 
-  for idx in "${!choices[@]}"; do
-    if (( idx == selected )); then
-      printf '  ❯ %s\n' "${choices[$idx]}"
+  printf '\033[H\033[2J'
+  printf 'ed_pfx_launcher interactive wizard\n'
+  printf 'Steam root: %s\n' "${state_ref[steam_root]}"
+  printf 'AppID: %s | Config: %s\n' "${state_ref[appid]}" "${state_ref[config_path]}"
+  printf 'Status: %s\n\n' "${state_ref[status]}"
+
+  printf 'Steps '
+  for idx in "${!steps[@]}"; do
+    marker=' '
+    (( idx == active_step )) && marker='>'
+    if [[ "$focus" == "steps" && $idx -eq $active_step ]]; then
+      printf '[%s* %s] ' "$marker" "${steps[$idx]}"
     else
-      printf '    %s\n' "${choices[$idx]}"
+      printf '[%s %s] ' "$marker" "${steps[$idx]}"
     fi
   done
+  printf '\n\n'
+
+  case "$active_step" in
+    0)
+      printf 'Detect\n'
+      printf '  Prefix candidates: %s\n' "${#prefix_candidates[@]}"
+      printf '  Proton candidates: %s\n' "${#proton_candidates[@]}"
+      printf '  Press Enter to continue to prefix selection.\n'
+      ;;
+    1)
+      printf 'Select Prefix\n'
+      for idx in "${!prefix_candidates[@]}"; do
+        marker=' '
+        (( idx == ${state_ref[prefix_idx]:-0} )) && marker='❯'
+        printf '  %s %s\n' "$marker" "${prefix_candidates[$idx]}"
+      done
+      ;;
+    2)
+      printf 'Select Proton\n'
+      for idx in "${!proton_candidates[@]}"; do
+        marker=' '
+        (( idx == ${state_ref[proton_idx]:-0} )) && marker='❯'
+        printf '  %s %s\n' "$marker" "${proton_candidates[$idx]}"
+      done
+      ;;
+    3)
+      printf 'Review\n'
+      printf '  Prefix: %s\n' "${state_ref[selected_prefix]:-<not selected>}"
+      printf '  Proton: %s\n' "${state_ref[selected_proton]:-<not selected>}"
+      printf '  Proton dir to save: %s\n' "${state_ref[selected_proton_dir]:-<not selected>}"
+      if [[ "${state_ref[is_valid]}" == "1" ]]; then
+        printf '  Validation: OK\n'
+      else
+        printf '  Validation: Incomplete\n'
+      fi
+      ;;
+    4)
+      printf 'Save\n'
+      printf '  Press Enter or s to persist selections.\n'
+      printf '  q cancels without modifying config.\n'
+      ;;
+  esac
+
+  printf '\nKeys: ↑/↓ (or j/k) move, Tab step/focus, Enter confirm, s=save, q=cancel\n'
 }
 
 prompt_selection_tui() {
@@ -630,7 +685,17 @@ prompt_selection_tui() {
   tput civis 2>/dev/null || true
   trap 'tput cnorm 2>/dev/null || true' RETURN
 
-  render_interactive_menu "$label" "$selected" "${choices[@]}"
+  printf '\r\033[J'
+  printf '%s\n' "$label"
+  printf '  Use ↑/↓ (or j/k), Enter to confirm, q to cancel.\n\n'
+  local idx
+  for idx in "${!choices[@]}"; do
+    if (( idx == selected )); then
+      printf '  ❯ %s\n' "${choices[$idx]}"
+    else
+      printf '    %s\n' "${choices[$idx]}"
+    fi
+  done
   while true; do
     IFS= read -rsn1 key || return 1
     case "$key" in
@@ -660,7 +725,16 @@ prompt_selection_tui() {
         ;;
     esac
 
-    render_interactive_menu "$label" "$selected" "${choices[@]}"
+    printf '\r\033[J'
+    printf '%s\n' "$label"
+    printf '  Use ↑/↓ (or j/k), Enter to confirm, q to cancel.\n\n'
+    for idx in "${!choices[@]}"; do
+      if (( idx == selected )); then
+        printf '  ❯ %s\n' "${choices[$idx]}"
+      else
+        printf '    %s\n' "${choices[$idx]}"
+      fi
+    done
   done
 }
 
@@ -829,12 +903,17 @@ detect_proton_candidates() {
 
 
 interactive_configure_paths() {
+  interactive_wizard_run "$@"
+}
+
+interactive_wizard_run() {
   local steam_root="$1"
   local appid="$2"
   local preferred_prefix_root="$3"
   local preferred_proton_root="$4"
-  local selected_prefix selected_proton
+  local selected_prefix selected_proton key
   local -a prefix_candidates=() proton_candidates=()
+  local -A wizard_state=()
 
   mapfile -t prefix_candidates < <(detect_prefix_candidates "$steam_root" "$appid" "$preferred_prefix_root")
   mapfile -t proton_candidates < <(detect_proton_candidates "$steam_root" "$preferred_proton_root")
@@ -846,9 +925,97 @@ interactive_configure_paths() {
     die "Interactive mode could not find any Proton candidates"
   fi
 
-  log "Interactive mode enabled: selecting prefix and Proton paths"
-  selected_prefix="$(prompt_selection "Detected Wine prefix locations:" "${prefix_candidates[@]}")"
-  selected_proton="$(prompt_selection "Detected Proton binaries:" "${proton_candidates[@]}")"
+  wizard_state[steam_root]="$steam_root"
+  wizard_state[appid]="$appid"
+  wizard_state[config_path]="$CONFIG_PATH"
+  wizard_state[active_step]=0
+  wizard_state[focus]=main
+  wizard_state[prefix_idx]=0
+  wizard_state[proton_idx]=0
+  wizard_state[status]="Detecting candidates"
+  wizard_state[prefix_candidates]="$(printf '%s\n' "${prefix_candidates[@]}")"
+  wizard_state[proton_candidates]="$(printf '%s\n' "${proton_candidates[@]}")"
+  wizard_state[is_valid]=0
+
+  [[ -t 0 && -t 1 ]] || die "Interactive mode requires a TTY"
+  tput civis 2>/dev/null || true
+  trap 'tput cnorm 2>/dev/null || true' RETURN
+
+  while true; do
+    selected_prefix="${prefix_candidates[${wizard_state[prefix_idx]}]}"
+    selected_proton="${proton_candidates[${wizard_state[proton_idx]}]}"
+    wizard_state[selected_prefix]="$selected_prefix"
+    wizard_state[selected_proton]="$selected_proton"
+    wizard_state[selected_proton_dir]="$(dirname "$selected_proton")"
+    if [[ -d "$selected_prefix/pfx" && -x "$selected_proton" ]]; then
+      wizard_state[is_valid]=1
+    else
+      wizard_state[is_valid]=0
+    fi
+    render_interactive_menu wizard_state
+    IFS= read -rsn1 key || return 1
+    case "$key" in
+      q|Q)
+        printf '\n'
+        log "Interactive wizard cancelled; config unchanged"
+        return 1
+        ;;
+      s|S)
+        if [[ "${wizard_state[is_valid]}" == "1" ]]; then
+          wizard_state[active_step]=4
+          break
+        else
+          wizard_state[status]="Cannot save: select valid prefix and Proton"
+        fi
+        ;;
+      "")
+        case "${wizard_state[active_step]}" in
+          0) wizard_state[active_step]=1; wizard_state[status]="Select a prefix" ;;
+          1) wizard_state[active_step]=2; wizard_state[status]="Prefix selected" ;;
+          2) wizard_state[active_step]=3; wizard_state[status]="Proton selected" ;;
+          3) wizard_state[active_step]=4; wizard_state[status]="Review complete" ;;
+          4) [[ "${wizard_state[is_valid]}" == "1" ]] && break ;;
+        esac
+        ;;
+      $'\t')
+        wizard_state[active_step]=$(( (wizard_state[active_step] + 1) % 5 ))
+        ;;
+      j)
+        case "${wizard_state[active_step]}" in
+          1) wizard_state[prefix_idx]=$(( (wizard_state[prefix_idx] + 1) % ${#prefix_candidates[@]} )) ;;
+          2) wizard_state[proton_idx]=$(( (wizard_state[proton_idx] + 1) % ${#proton_candidates[@]} )) ;;
+        esac
+        ;;
+      k)
+        case "${wizard_state[active_step]}" in
+          1) wizard_state[prefix_idx]=$(( (wizard_state[prefix_idx] - 1 + ${#prefix_candidates[@]}) % ${#prefix_candidates[@]} )) ;;
+          2) wizard_state[proton_idx]=$(( (wizard_state[proton_idx] - 1 + ${#proton_candidates[@]}) % ${#proton_candidates[@]} )) ;;
+        esac
+        ;;
+      $'\x1b')
+        IFS= read -rsn1 -t 0.05 key || continue
+        [[ "$key" == "[" ]] || continue
+        IFS= read -rsn1 -t 0.05 key || continue
+        case "$key" in
+          A)
+            case "${wizard_state[active_step]}" in
+              1) wizard_state[prefix_idx]=$(( (wizard_state[prefix_idx] - 1 + ${#prefix_candidates[@]}) % ${#prefix_candidates[@]} )) ;;
+              2) wizard_state[proton_idx]=$(( (wizard_state[proton_idx] - 1 + ${#proton_candidates[@]}) % ${#proton_candidates[@]} )) ;;
+            esac
+            ;;
+          B)
+            case "${wizard_state[active_step]}" in
+              1) wizard_state[prefix_idx]=$(( (wizard_state[prefix_idx] + 1) % ${#prefix_candidates[@]} )) ;;
+              2) wizard_state[proton_idx]=$(( (wizard_state[proton_idx] + 1) % ${#proton_candidates[@]} )) ;;
+            esac
+            ;;
+        esac
+        ;;
+    esac
+  done
+
+  selected_prefix="${wizard_state[selected_prefix]}"
+  selected_proton="${wizard_state[selected_proton]}"
 
   write_config_value "steam" "prefix_dir" "$selected_prefix" "$CONFIG_PATH"
   write_config_value "proton" "dir" "$(dirname "$selected_proton")" "$CONFIG_PATH"
@@ -2032,7 +2199,7 @@ set_var STEAM_ROOT "$(expand_tokens "$(cfg_get 'steam.steam_root' '')")"
 [[ -z "$STEAM_ROOT" ]] && set_var STEAM_ROOT "$(detect_steam_root || true)"
 [[ -n "$STEAM_ROOT" && -d "$STEAM_ROOT" ]] || { phase_fail "detect steam/prefix/runtime" "steam root not found"; die "steam root not found"; }
 if [[ "$INTERACTIVE" -eq 1 ]]; then
-  interactive_configure_paths "$STEAM_ROOT" "$APPID" "$PREFIX_DIR" "$PROTON_DIR"
+  interactive_wizard_run "$STEAM_ROOT" "$APPID" "$PREFIX_DIR" "$PROTON_DIR"
 fi
 if [[ -n "$PREFIX_DIR" ]]; then
   set_var PREFIX_DIR "$(normalize_prefix_dir "$PREFIX_DIR")"
