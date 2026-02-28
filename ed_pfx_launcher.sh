@@ -105,11 +105,12 @@ PREFIX_DIR_CLI=""
 PREFIX_SELECT_CLI=""
 PROTON_DIR_CLI=""
 PROTON_SELECT_CLI=""
+INTERACTIVE_UI_CLI=""
 
 usage() {
   cat <<USAGE
 Usage:
-  $SCRIPT_NAME [--config <ini>] [--prefix-dir <path>] [--prefix-select <first|newest>] [--proton-dir <path>] [--proton-select <first|newest>] [--interactive] [--no-game] [--wait-tools] [--tool <exe>]... [--dry-run] [--print-resolved] [--self-test] [--pass-command|--no-pass-command] [--debug] [--] %command%
+  $SCRIPT_NAME [--config <ini>] [--prefix-dir <path>] [--prefix-select <first|newest>] [--proton-dir <path>] [--proton-select <first|newest>] [--interactive] [--interactive-ui <legacy|wizard>] [--no-game] [--wait-tools] [--tool <exe>]... [--dry-run] [--print-resolved] [--self-test] [--pass-command|--no-pass-command] [--debug] [--] %command%
 USAGE
 }
 
@@ -122,6 +123,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=1; shift;;
     --print-resolved) PRINT_RESOLVED=1; shift;;
     --interactive) INTERACTIVE=1; shift;;
+    --interactive-ui) INTERACTIVE_UI_CLI="${2:-}"; shift 2;;
     --self-test) SELF_TEST=1; shift;;
     --prefix-dir) PREFIX_DIR_CLI="${2:-}"; shift 2;;
     --prefix-select) PREFIX_SELECT_CLI="${2:-}"; shift 2;;
@@ -300,6 +302,7 @@ log_effective_config() {
   log "  steam.prefix_select=$PREFIX_SELECT source=$(cfg_source_or_unknown 'steam.prefix_select')"
   log "  proton.dir=$PROTON_DIR source=$(cfg_source_or_unknown 'proton.dir')"
   log "  proton.select=$PROTON_SELECT source=$(cfg_source_or_unknown 'proton.select')"
+  log "  interactive.ui=$INTERACTIVE_UI source=$(cfg_source_or_unknown 'interactive.ui')"
   log "  resolved.prefix_dir=$PREFIX_DIR"
   log "  resolved.proton_bin=$PROTON_BIN"
   log "  elite.launcher_preference=$LAUNCHER_PREFERENCE source=$(cfg_source_or_unknown 'elite.launcher_preference')"
@@ -744,9 +747,11 @@ prompt_selection() {
   local -a choices=("$@")
 
   if prompt_selection_tui "$label" "${choices[@]}"; then
+    debug "Legacy prompt selection used prompt_selection_tui for '$label'"
     return 0
   fi
 
+  debug "Legacy prompt_selection_tui unavailable for '$label'; using pick_one fallback"
   pick_one "$label" "${choices[@]}"
 }
 
@@ -1062,7 +1067,119 @@ detect_proton_candidates() {
 
 
 interactive_configure_paths() {
-  interactive_wizard_run "$@"
+  local steam_root="$1"
+  local appid="$2"
+  local preferred_prefix_root="$3"
+  local preferred_proton_root="$4"
+  local requested_ui="${INTERACTIVE_UI:-wizard}"
+  local selected_ui="$requested_ui"
+  local reason="Requested UI from config/CLI"
+
+  case "$requested_ui" in
+    wizard)
+      if ! wizard_terminal_capabilities_ok reason; then
+        selected_ui="legacy"
+      fi
+      ;;
+    legacy)
+      reason="Legacy UI explicitly selected"
+      ;;
+    *)
+      warn "Invalid interactive UI '$requested_ui'; defaulting to wizard with capability fallback"
+      requested_ui="wizard"
+      selected_ui="wizard"
+      reason="Invalid request defaulted to wizard"
+      if ! wizard_terminal_capabilities_ok reason; then
+        selected_ui="legacy"
+      fi
+      ;;
+  esac
+
+  log "Interactive UI route selected: ui=$selected_ui requested=$requested_ui source=$(cfg_source_or_unknown 'interactive.ui') reason=$reason"
+  debug "Interactive routing context: tty0=$([[ -t 0 ]] && echo yes || echo no) tty1=$([[ -t 1 ]] && echo yes || echo no) TERM=${TERM:-<unset>}"
+
+  if [[ "$selected_ui" == "legacy" ]]; then
+    warn "Interactive legacy UI is deprecated and will be removed after one release window"
+    interactive_legacy_run "$steam_root" "$appid" "$preferred_prefix_root" "$preferred_proton_root"
+    return
+  fi
+
+  interactive_wizard_run "$steam_root" "$appid" "$preferred_prefix_root" "$preferred_proton_root"
+}
+
+wizard_terminal_capabilities_ok() {
+  local -n reason_ref="$1"
+  reason_ref="wizard terminal capabilities are sufficient"
+
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    reason_ref="non-TTY session detected"
+    return 1
+  fi
+
+  if ! have tput; then
+    reason_ref="terminal capability check failed: 'tput' not found"
+    return 1
+  fi
+
+  local cols lines
+  cols="$(tput cols 2>/dev/null || echo 0)"
+  lines="$(tput lines 2>/dev/null || echo 0)"
+  if [[ ! "$cols" =~ ^[0-9]+$ || ! "$lines" =~ ^[0-9]+$ || "$cols" -lt 60 || "$lines" -lt 15 ]]; then
+    reason_ref="terminal size/capabilities insufficient for wizard (cols=${cols:-?} lines=${lines:-?})"
+    return 1
+  fi
+
+  return 0
+}
+
+interactive_legacy_run() {
+  local steam_root="$1"
+  local appid="$2"
+  local preferred_prefix_root="$3"
+  local preferred_proton_root="$4"
+  local selected_prefix selected_proton
+  local -a prefix_candidates=() proton_candidates=()
+
+  mapfile -t prefix_candidates < <(detect_prefix_candidates "$steam_root" "$appid" "$preferred_prefix_root")
+  mapfile -t proton_candidates < <(detect_proton_candidates "$steam_root" "$preferred_proton_root")
+
+  if (( ${#prefix_candidates[@]} == 0 )); then
+    die "Interactive mode could not find any Wine prefix candidates"
+  fi
+  if (( ${#proton_candidates[@]} == 0 )); then
+    die "Interactive mode could not find any Proton candidates"
+  fi
+
+  if [[ -t 0 && -t 1 ]]; then
+    selected_prefix="$(prompt_selection "Select Wine prefix candidate" "${prefix_candidates[@]}")" || {
+      warn "Legacy interactive selection cancelled; config unchanged"
+      return 1
+    }
+    selected_proton="$(prompt_selection "Select Proton candidate" "${proton_candidates[@]}")" || {
+      warn "Legacy interactive selection cancelled; config unchanged"
+      return 1
+    }
+    log "Legacy interactive UI used menu-based selection"
+  else
+    selected_prefix="$(select_path_by_mode "$PREFIX_SELECT" "${prefix_candidates[@]}")"
+    selected_proton="$(select_path_by_mode "$PROTON_SELECT" "${proton_candidates[@]}")"
+    log "Legacy interactive UI auto-selected values in non-TTY mode (prefix_select=$PREFIX_SELECT proton_select=$PROTON_SELECT)"
+  fi
+
+  if ! commit_interactive_config_changes "$CONFIG_PATH" "$selected_prefix" "$(dirname "$selected_proton")"; then
+    warn "Legacy interactive save failed; leaving configuration unchanged"
+    return 1
+  fi
+
+  CFG['steam.prefix_dir']="$selected_prefix"
+  CFG['proton.dir']="$(dirname "$selected_proton")"
+  CFG_SOURCE['steam.prefix_dir']="interactive"
+  CFG_SOURCE['proton.dir']="interactive"
+  PREFIX_DIR="$selected_prefix"
+  PROTON_DIR="$(dirname "$selected_proton")"
+
+  log "Legacy interactive selection applied: steam.prefix_dir=$selected_prefix"
+  log "Legacy interactive selection applied: proton.dir=$(dirname "$selected_proton")"
 }
 
 interactive_wizard_run() {
@@ -2292,7 +2409,9 @@ case "$PREFIX_SELECT" in
 esac
 cfg_assign_select PROTON_DIR 'proton.dir' '' 'proton.dir'
 cfg_assign_select PROTON_SELECT 'proton.select' 'first' 'proton.select'
+cfg_assign_select INTERACTIVE_UI 'interactive.ui' 'wizard' 'interactive.ui'
 PROTON_SELECT="${PROTON_SELECT,,}"
+INTERACTIVE_UI="${INTERACTIVE_UI,,}"
 case "$PROTON_SELECT" in
   first|newest) ;;
   *) warn "Invalid proton.select='$PROTON_SELECT'; defaulting to first"; PROTON_SELECT="first"; CFG_SOURCE['proton.select']="default" ;;
@@ -2323,6 +2442,10 @@ if [[ -n "$PROTON_SELECT_CLI" ]]; then
   PROTON_SELECT="${PROTON_SELECT_CLI,,}"
   CFG_SOURCE['proton.select']="cli"
 fi
+if [[ -n "$INTERACTIVE_UI_CLI" ]]; then
+  INTERACTIVE_UI="${INTERACTIVE_UI_CLI,,}"
+  CFG_SOURCE['interactive.ui']="cli"
+fi
 case "$PREFIX_SELECT" in
   first|newest) ;;
   *) warn "Invalid prefix selection '$PREFIX_SELECT'; defaulting to first"; PREFIX_SELECT="first"; [[ "${CFG_SOURCE['steam.prefix_select']}" == "cli" ]] || CFG_SOURCE['steam.prefix_select']="default" ;;
@@ -2330,6 +2453,10 @@ esac
 case "$PROTON_SELECT" in
   first|newest) ;;
   *) warn "Invalid proton selection '$PROTON_SELECT'; defaulting to first"; PROTON_SELECT="first"; [[ "${CFG_SOURCE['proton.select']}" == "cli" ]] || CFG_SOURCE['proton.select']="default" ;;
+esac
+case "$INTERACTIVE_UI" in
+  wizard|legacy) ;;
+  *) warn "Invalid interactive.ui='$INTERACTIVE_UI'; defaulting to wizard"; INTERACTIVE_UI="wizard"; [[ "${CFG_SOURCE['interactive.ui']}" == "cli" ]] || CFG_SOURCE['interactive.ui']="default" ;;
 esac
 ELITE_PLATFORM="$(cfg_get 'elite.platform' 'frontier')"
 ELITE_PLATFORM="${ELITE_PLATFORM,,}"
@@ -2360,7 +2487,7 @@ set_var STEAM_ROOT "$(expand_tokens "$(cfg_get 'steam.steam_root' '')")"
 [[ -z "$STEAM_ROOT" ]] && set_var STEAM_ROOT "$(detect_steam_root || true)"
 [[ -n "$STEAM_ROOT" && -d "$STEAM_ROOT" ]] || { phase_fail "detect steam/prefix/runtime" "steam root not found"; die "steam root not found"; }
 if [[ "$INTERACTIVE" -eq 1 ]]; then
-  interactive_wizard_run "$STEAM_ROOT" "$APPID" "$PREFIX_DIR" "$PROTON_DIR"
+  interactive_configure_paths "$STEAM_ROOT" "$APPID" "$PREFIX_DIR" "$PROTON_DIR"
 fi
 if [[ -n "$PREFIX_DIR" ]]; then
   set_var PREFIX_DIR "$(normalize_prefix_dir "$PREFIX_DIR")"
