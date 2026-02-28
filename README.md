@@ -17,3 +17,12 @@ The native Linux `MinEdLauncher` path is only selected for Steam mode because it
 ## Why launcher exit is not treated as an immediate failure
 
 `MinEdLauncher` can behave like a short-lived wrapper and exit after spawning the game process. For that reason, early launcher exit is recorded as a warning, but detection keeps polling for `EliteDangerous64.exe` until the configured game timeout.
+
+## Prefix and Proton directory selection
+
+Both the Wine prefix and Proton install now support dynamic detection, config overrides, and CLI overrides:
+
+- Prefix dir precedence: `--prefix-dir` → `[prefix] dir` → auto-detected compatdata `pfx` path.
+- Proton dir precedence: `--proton-dir` → `[proton] dir` → deprecated `[proton] proton` compatibility key → auto-detected Proton directory.
+
+When detected automatically, the script scans common Steam locations under `steamapps/compatdata` and `compatibilitytools.d`.
