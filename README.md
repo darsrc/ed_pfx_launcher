@@ -38,3 +38,12 @@ You can override or tune detection for the Wine prefix and Proton install:
 When `steam.compatdata_dir` is still present, it is treated as a compatibility alias for `steam.prefix_dir`.
 
 When `--interactive` is used, the script scans for all detectable prefix and Proton locations, routes to the selected interactive UI path, and writes `[steam] prefix_dir` and `[proton] dir` into the active config file before continuing. `wizard` is preferred by default for TTY sessions; it automatically falls back to `legacy` for non-TTY sessions or insufficient terminal capabilities. Logs include which UI path was selected and why. The legacy path is deprecated and retained for one release window during rollout.
+
+## Smoke harness
+
+Run `scripts/smoke_interactive.sh` for a deterministic local smoke pass/fail summary. The harness is non-network and uses temporary local config files to verify:
+
+- unset-variable safety in bootstrap token expansion,
+- interactive wizard cancel path does not modify config,
+- interactive save path writes both `[steam] prefix_dir` and `[proton] dir`,
+- non-TTY wizard fallback to legacy interactive path.
