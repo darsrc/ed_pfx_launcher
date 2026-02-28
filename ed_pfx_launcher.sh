@@ -91,9 +91,8 @@ WAIT_TOOLS=0
 DRY_RUN=0
 SELF_TEST=0
 PRINT_RESOLVED=0
+INTERACTIVE=0
 DEBUG=0
-PREFIX_DIR_OVERRIDE=""
-PROTON_DIR_OVERRIDE=""
 declare -a CLI_TOOLS=()
 declare -a FORWARDED_CMD=()
 declare -a MINED_ARGS_ARR=()
@@ -110,20 +109,19 @@ PROTON_SELECT_CLI=""
 usage() {
   cat <<USAGE
 Usage:
-  $SCRIPT_NAME [--config <ini>] [--prefix-dir <path>] [--prefix-select <first|newest>] [--proton-dir <path>] [--proton-select <first|newest>] [--no-game] [--wait-tools] [--tool <exe>]... [--dry-run] [--print-resolved] [--self-test] [--pass-command|--no-pass-command] [--debug] [--] %command%
+  $SCRIPT_NAME [--config <ini>] [--prefix-dir <path>] [--prefix-select <first|newest>] [--proton-dir <path>] [--proton-select <first|newest>] [--interactive] [--no-game] [--wait-tools] [--tool <exe>]... [--dry-run] [--print-resolved] [--self-test] [--pass-command|--no-pass-command] [--debug] [--] %command%
 USAGE
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) CONFIG_PATH="${2:-}"; shift 2;;
-    --prefix-dir) PREFIX_DIR_OVERRIDE="${2:-}"; shift 2;;
-    --proton-dir) PROTON_DIR_OVERRIDE="${2:-}"; shift 2;;
     --tool) CLI_TOOLS+=("${2:-}"); shift 2;;
     --no-game) NO_GAME=1; shift;;
     --wait-tools) WAIT_TOOLS=1; shift;;
     --dry-run) DRY_RUN=1; shift;;
     --print-resolved) PRINT_RESOLVED=1; shift;;
+    --interactive) INTERACTIVE=1; shift;;
     --self-test) SELF_TEST=1; shift;;
     --prefix-dir) PREFIX_DIR_CLI="${2:-}"; shift 2;;
     --prefix-select) PREFIX_SELECT_CLI="${2:-}"; shift 2;;
@@ -336,9 +334,12 @@ expand_tokens() {
 detect_steam_root() {
   local c="${STEAM_COMPAT_CLIENT_INSTALL_PATH:-}"
   [[ -n "$c" && -d "$c" ]] && { printf '%s' "$c"; return 0; }
-  for c in "$HOME/.local/share/Steam" "$HOME/.steam/debian-installation" "$HOME/.steam/steam"; do
-    [[ -d "$c" ]] && { printf '%s' "$c"; return 0; }
-  done
+
+  local candidate
+  while IFS= read -r candidate; do
+    [[ -d "$candidate" ]] && { printf '%s' "$candidate"; return 0; }
+  done < <(discover_steam_roots)
+
   return 1
 }
 
@@ -371,6 +372,49 @@ resolve_runtime_client_from_processes() {
   fi
 
   printf '%s' "$candidate"
+}
+
+extract_library_paths() {
+  local vdf="$1"
+  [[ -f "$vdf" ]] || return 0
+
+  sed -n 's/.*"path"[[:space:]]*"\(.*\)".*/\1/p' "$vdf"
+  sed -n 's/^[[:space:]]*"[0-9]\+"[[:space:]]*"\(.*\)".*/\1/p' "$vdf"
+}
+
+uniq_lines() { awk '!seen[$0]++'; }
+
+discover_steam_roots() {
+  local -a roots=(
+    "$HOME/.local/share/Steam"
+    "$HOME/.steam/debian-installation"
+    "$HOME/.steam/steam"
+    "$HOME/.steam/root"
+    "$HOME/.steam"
+    "/usr/share/steam"
+  )
+  local r
+  for r in "${roots[@]}"; do
+    [[ -d "$r/steamapps" ]] && printf '%s\n' "$r"
+  done | uniq_lines
+}
+
+discover_libraries() {
+  local -a roots=("$@")
+  local root vdf p
+  local -a libs=()
+
+  for root in "${roots[@]}"; do
+    [[ -d "$root/steamapps" ]] && libs+=("$root")
+
+    vdf="$root/steamapps/libraryfolders.vdf"
+    while IFS= read -r p; do
+      [[ -n "$p" ]] || continue
+      [[ -d "$p/steamapps" ]] && libs+=("$p")
+    done < <(extract_library_paths "$vdf" || true)
+  done
+
+  printf '%s\n' "${libs[@]}" | uniq_lines
 }
 
 normalize_prefix_dir() {
@@ -410,98 +454,250 @@ select_path_by_mode() {
   return 1
 }
 
-detect_prefix_dir() {
-  local steam_root="$1" appid="$2" preferred_base="$3" select_mode="$4"
-  local -a compat_roots=() prefix_candidates=()
-  local root dir normalized
+discover_prefix_candidates() {
+  local appid="$1"
+  local preferred_base="$2"
+  local -a libs=() all_roots=() out=()
+  local lib compat normalized
 
   if [[ -n "${STEAM_COMPAT_DATA_PATH:-}" ]]; then
     normalized="$(normalize_prefix_dir "$STEAM_COMPAT_DATA_PATH")"
-    if [[ -d "$normalized/pfx" ]]; then
-      prefix_candidates+=("$normalized")
-    fi
+    [[ -d "$normalized/pfx" ]] && out+=("$normalized")
   fi
 
   if [[ -n "$preferred_base" ]]; then
-    compat_roots+=("$preferred_base")
+    normalized="$(normalize_prefix_dir "$preferred_base")"
+    if [[ -d "$normalized/pfx" ]]; then
+      out+=("$normalized")
+    elif [[ -d "$normalized/steamapps" ]]; then
+      libs+=("$normalized")
+    elif [[ -d "$normalized" ]]; then
+      for compat in "$normalized"/*; do
+        [[ -d "$compat/pfx" ]] && out+=("$compat")
+      done
+    fi
   fi
-  compat_roots+=(
-    "$steam_root/steamapps/compatdata"
-    "$HOME/.local/share/Steam/steamapps/compatdata"
-    "$HOME/.steam/debian-installation/steamapps/compatdata"
-    "$HOME/.steam/steam/steamapps/compatdata"
-  )
 
-  for root in "${compat_roots[@]}"; do
-    [[ -d "$root" ]] || continue
+  mapfile -t all_roots < <(discover_steam_roots)
+  mapfile -t libs < <(printf '%s\n' "${libs[@]}"; discover_libraries "${all_roots[@]}" | uniq_lines)
 
-    dir="$root/$appid"
-    [[ -d "$dir/pfx" ]] && prefix_candidates+=("$dir")
+  for lib in "${libs[@]}"; do
+    [[ -d "$lib/steamapps/compatdata" ]] || continue
+    compat="$lib/steamapps/compatdata/$appid"
+    [[ -d "$compat/pfx" ]] && out+=("$compat")
 
-    for dir in "$root"/*; do
-      [[ -d "$dir/pfx" ]] && prefix_candidates+=("$dir")
+    for compat in "$lib/steamapps/compatdata"/*; do
+      [[ -d "$compat/pfx" ]] && out+=("$compat")
     done
   done
 
-  local -A seen=()
-  local -a unique=()
-  for dir in "${prefix_candidates[@]}"; do
-    normalized="$(normalize_prefix_dir "$dir")"
-    [[ -d "$normalized/pfx" ]] || continue
-    if [[ -z "${seen[$normalized]+x}" ]]; then
-      seen["$normalized"]=1
-      unique+=("$normalized")
-    fi
+  printf '%s\n' "${out[@]}" | awk 'NF' | uniq_lines
+}
+
+detect_prefix_candidates() {
+  local steam_root="$1" appid="$2" preferred_base="$3"
+  discover_prefix_candidates "$appid" "$preferred_base"
+}
+
+detect_prefix_dir() {
+  local steam_root="$1" appid="$2" preferred_base="$3" select_mode="$4"
+  local -a candidates=()
+  mapfile -t candidates < <(detect_prefix_candidates "$steam_root" "$appid" "$preferred_base")
+  (( ${#candidates[@]} > 0 )) || return 1
+  select_path_by_mode "$select_mode" "${candidates[@]}"
+}
+
+discover_proton_candidates() {
+  local steam_root="$1"
+  local preferred_dir="$2"
+  local -a all_roots=() tool_dirs=() candidates=()
+  local d pd
+
+  [[ -n "$preferred_dir" ]] && tool_dirs+=("$preferred_dir")
+
+  mapfile -t all_roots < <(discover_steam_roots)
+  [[ -n "$steam_root" ]] && all_roots+=("$steam_root")
+
+  tool_dirs+=(
+    "$HOME/.local/share/Steam/compatibilitytools.d"
+    "$HOME/.steam/root/compatibilitytools.d"
+    "$HOME/.steam/debian-installation/compatibilitytools.d"
+    "$HOME/.steam/steam/compatibilitytools.d"
+    "/usr/share/steam/compatibilitytools.d"
+    "/usr/local/share/steam/compatibilitytools.d"
+  )
+
+  for d in "${all_roots[@]}"; do
+    tool_dirs+=("$d/compatibilitytools.d")
+    tool_dirs+=("$d/steamapps/compatibilitytools.d")
+    tool_dirs+=("$d/steamapps/common")
   done
 
-  (( ${#unique[@]} > 0 )) || return 1
+  for d in "${tool_dirs[@]}"; do
+    [[ -d "$d" ]] || continue
 
-  select_path_by_mode "$select_mode" "${unique[@]}"
+    if [[ -x "$d/proton" && -x "$d/files/bin/wine" ]]; then
+      candidates+=("$d/proton")
+      continue
+    fi
+
+    for pd in "$d"/*; do
+      [[ -d "$pd" ]] || continue
+      [[ -x "$pd/proton" ]] || continue
+      [[ -x "$pd/files/bin/wine" ]] || continue
+      candidates+=("$pd/proton")
+    done
+  done
+
+  printf '%s\n' "${candidates[@]}" | awk 'NF' | uniq_lines
+}
+
+detect_proton_candidates() {
+  local steam_root="$1" proton_dir="$2"
+  discover_proton_candidates "$steam_root" "$proton_dir"
 }
 
 find_proton() {
   local steam_root="$1" proton_dir="$2" select_mode="$3"
-  local -a bases=() candidates=()
-  local base p
-
-  if [[ -n "$proton_dir" ]]; then
-    bases+=("$proton_dir")
-  fi
-
-  bases+=(
-    "$steam_root/steamapps/common"
-    "$HOME/.steam/steam/compatibilitytools.d"
-    "$HOME/.steam/debian-installation/compatibilitytools.d"
-    "$HOME/.local/share/Steam/compatibilitytools.d"
-  )
-
-  for base in "${bases[@]}"; do
-    [[ -d "$base" ]] || continue
-
-    if [[ -x "$base/proton" ]]; then
-      candidates+=("$base/proton")
-      continue
-    fi
-
-    for p in "$base"/Proton*/proton "$base"/*/proton; do
-      [[ -x "$p" ]] && candidates+=("$p")
-    done
-  done
-
-  local -A seen=()
-  local -a unique=()
-  for p in "${candidates[@]}"; do
-    if [[ -z "${seen[$p]+x}" ]]; then
-      seen["$p"]=1
-      unique+=("$p")
-    fi
-  done
-
-  (( ${#unique[@]} > 0 )) || return 1
-
-  select_path_by_mode "$select_mode" "${unique[@]}"
+  local -a candidates=()
+  mapfile -t candidates < <(detect_proton_candidates "$steam_root" "$proton_dir")
+  (( ${#candidates[@]} > 0 )) || return 1
+  select_path_by_mode "$select_mode" "${candidates[@]}"
 }
 
+pick_one() {
+  local prompt="$1"
+  shift
+  local -a options=("$@")
+  local idx
+
+  (( ${#options[@]} > 0 )) || return 1
+
+  if have fzf && [[ -t 0 && -t 1 ]]; then
+    printf '%s\n' "${options[@]}" | fzf --prompt="$prompt " --height=40% --reverse
+    return $?
+  fi
+
+  echo
+  echo "$prompt"
+  for idx in "${!options[@]}"; do
+    echo "  $((idx + 1))) ${options[$idx]}"
+  done
+
+  while true; do
+    read -r -p "Select [1-${#options[@]}]: " idx
+    if [[ "$idx" =~ ^[0-9]+$ ]] && (( idx >= 1 && idx <= ${#options[@]} )); then
+      printf '%s' "${options[$((idx - 1))]}"
+      return 0
+    fi
+    echo "Invalid selection '$idx'. Please choose 1-${#options[@]}." >&2
+  done
+}
+
+prompt_selection() {
+  local label="$1"
+  shift
+  pick_one "$label" "$@"
+}
+
+write_config_value() {
+  local section="$1" key="$2" value="$3" file="$4"
+  python3 - "$file" "$section" "$key" "$value" <<'PY'
+from pathlib import Path
+import sys
+
+file_path = Path(sys.argv[1])
+section = sys.argv[2].lower()
+key = sys.argv[3].lower()
+value = sys.argv[4]
+
+text = file_path.read_text(encoding='utf-8')
+lines = text.splitlines(keepends=True)
+
+def normalize_newline(lines):
+    if not lines:
+        return '\n'
+    return '\r\n' if any(line.endswith('\r\n') for line in lines) else '\n'
+
+newline = normalize_newline(lines)
+section_start = None
+section_end = len(lines)
+for i, line in enumerate(lines):
+    stripped = line.strip()
+    if stripped.startswith('[') and stripped.endswith(']'):
+        current = stripped[1:-1].strip().lower()
+        if section_start is None:
+            if current == section:
+                section_start = i
+        elif i > section_start:
+            section_end = i
+            break
+
+entry = f"{key}={value}{newline}"
+if section_start is None:
+    if lines and not lines[-1].endswith(('\n', '\r')):
+        lines[-1] += newline
+    if lines and lines[-1].strip():
+        lines.append(newline)
+    lines.append(f"[{section}]{newline}")
+    lines.append(entry)
+else:
+    key_line = None
+    for i in range(section_start + 1, section_end):
+        stripped = lines[i].strip()
+        if not stripped or stripped.startswith(';') or stripped.startswith('#') or '=' not in stripped:
+            continue
+        existing_key = stripped.split('=', 1)[0].strip().lower()
+        if existing_key == key:
+            key_line = i
+            break
+    if key_line is None:
+        insert_at = section_end
+        while insert_at > section_start + 1 and not lines[insert_at - 1].strip():
+            insert_at -= 1
+        lines.insert(insert_at, entry)
+    else:
+        lines[key_line] = entry
+
+file_path.write_text(''.join(lines), encoding='utf-8')
+PY
+}
+
+interactive_configure_paths() {
+  local steam_root="$1"
+  local appid="$2"
+  local preferred_prefix_root="$3"
+  local preferred_proton_root="$4"
+  local selected_prefix selected_proton
+  local -a prefix_candidates=() proton_candidates=()
+
+  mapfile -t prefix_candidates < <(detect_prefix_candidates "$steam_root" "$appid" "$preferred_prefix_root")
+  mapfile -t proton_candidates < <(detect_proton_candidates "$steam_root" "$preferred_proton_root")
+
+  if (( ${#prefix_candidates[@]} == 0 )); then
+    die "Interactive mode could not find any Wine prefix candidates"
+  fi
+  if (( ${#proton_candidates[@]} == 0 )); then
+    die "Interactive mode could not find any Proton candidates"
+  fi
+
+  log "Interactive mode enabled: selecting prefix and Proton paths"
+  selected_prefix="$(prompt_selection "Detected Wine prefix locations:" "${prefix_candidates[@]}")"
+  selected_proton="$(prompt_selection "Detected Proton binaries:" "${proton_candidates[@]}")"
+
+  write_config_value "steam" "prefix_dir" "$selected_prefix" "$CONFIG_PATH"
+  write_config_value "proton" "dir" "$(dirname "$selected_proton")" "$CONFIG_PATH"
+
+  CFG['steam.prefix_dir']="$selected_prefix"
+  CFG['proton.dir']="$(dirname "$selected_proton")"
+  CFG_SOURCE['steam.prefix_dir']="interactive"
+  CFG_SOURCE['proton.dir']="interactive"
+  PREFIX_DIR="$selected_prefix"
+  PROTON_DIR="$(dirname "$selected_proton")"
+
+  log "Saved steam.prefix_dir=$selected_prefix to $CONFIG_PATH"
+  log "Saved proton.dir=$(dirname "$selected_proton") to $CONFIG_PATH"
+}
 wait_for_process_any() {
   local timeout="$1"; shift
   local i=0 p
@@ -1557,12 +1753,12 @@ build_game_command() {
 }
 
 ini_load "$CONFIG_PATH"
-if [[ -n "$CLI_PREFIX_DIR" ]]; then
-  CFG['steam.prefix_dir']="$CLI_PREFIX_DIR"
+if [[ -n "$PREFIX_DIR_CLI" ]]; then
+  CFG['steam.prefix_dir']="$PREFIX_DIR_CLI"
   CFG_SOURCE['steam.prefix_dir']="cli"
 fi
-if [[ -n "$CLI_PROTON_DIR" ]]; then
-  CFG['proton.dir']="$CLI_PROTON_DIR"
+if [[ -n "$PROTON_DIR_CLI" ]]; then
+  CFG['proton.dir']="$PROTON_DIR_CLI"
   CFG_SOURCE['proton.dir']="cli"
 fi
 log_loaded_config
@@ -1669,6 +1865,9 @@ detected_bus_name=""
 set_var STEAM_ROOT "$(expand_tokens "$(cfg_get 'steam.steam_root' '')")"
 [[ -z "$STEAM_ROOT" ]] && set_var STEAM_ROOT "$(detect_steam_root || true)"
 [[ -n "$STEAM_ROOT" && -d "$STEAM_ROOT" ]] || { phase_fail "detect steam/prefix/runtime" "steam root not found"; die "steam root not found"; }
+if [[ "$INTERACTIVE" -eq 1 ]]; then
+  interactive_configure_paths "$STEAM_ROOT" "$APPID" "$PREFIX_DIR" "$PROTON_DIR"
+fi
 if [[ -n "$PREFIX_DIR" ]]; then
   set_var PREFIX_DIR "$(normalize_prefix_dir "$PREFIX_DIR")"
   if [[ ! -d "$PREFIX_DIR/pfx" ]]; then
