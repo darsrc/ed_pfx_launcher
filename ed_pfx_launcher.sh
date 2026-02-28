@@ -92,6 +92,8 @@ DRY_RUN=0
 SELF_TEST=0
 PRINT_RESOLVED=0
 DEBUG=0
+PREFIX_DIR_OVERRIDE=""
+PROTON_DIR_OVERRIDE=""
 declare -a CLI_TOOLS=()
 declare -a FORWARDED_CMD=()
 declare -a MINED_ARGS_ARR=()
@@ -115,6 +117,8 @@ USAGE
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) CONFIG_PATH="${2:-}"; shift 2;;
+    --prefix-dir) PREFIX_DIR_OVERRIDE="${2:-}"; shift 2;;
+    --proton-dir) PROTON_DIR_OVERRIDE="${2:-}"; shift 2;;
     --tool) CLI_TOOLS+=("${2:-}"); shift 2;;
     --no-game) NO_GAME=1; shift;;
     --wait-tools) WAIT_TOOLS=1; shift;;
