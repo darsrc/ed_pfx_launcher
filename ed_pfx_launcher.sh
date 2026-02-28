@@ -100,17 +100,21 @@ STEAM_MODE=0
 FRONTIER_ACTIVE=0
 PASS_COMMAND="false"
 PASS_COMMAND_EXPLICIT="false"
+CLI_PREFIX_DIR=""
+CLI_PROTON_DIR=""
 
 usage() {
   cat <<USAGE
 Usage:
-  $SCRIPT_NAME [--config <ini>] [--no-game] [--wait-tools] [--tool <exe>]... [--dry-run] [--print-resolved] [--self-test] [--pass-command|--no-pass-command] [--debug] [--] %command%
+  $SCRIPT_NAME [--config <ini>] [--prefix-dir <path>] [--proton-dir <path>] [--no-game] [--wait-tools] [--tool <exe>]... [--dry-run] [--print-resolved] [--self-test] [--pass-command|--no-pass-command] [--debug] [--] %command%
 USAGE
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config) CONFIG_PATH="${2:-}"; shift 2;;
+    --prefix-dir) CLI_PREFIX_DIR="${2:-}"; shift 2;;
+    --proton-dir) CLI_PROTON_DIR="${2:-}"; shift 2;;
     --tool) CLI_TOOLS+=("${2:-}"); shift 2;;
     --no-game) NO_GAME=1; shift;;
     --wait-tools) WAIT_TOOLS=1; shift;;
@@ -288,6 +292,8 @@ log_effective_config() {
   log "  detection.game_timeout=$GAME_DETECT_TIMEOUT source=$(cfg_source_or_unknown 'detection.game_timeout')"
   log "  elite.launcher_preference=$LAUNCHER_PREFERENCE source=$(cfg_source_or_unknown 'elite.launcher_preference')"
   log "  elite.pass_command=$PASS_COMMAND source=$(cfg_source_or_unknown 'elite.pass_command')"
+  log "  steam.prefix_dir=$WINEPREFIX source=$(cfg_source_or_unknown 'steam.prefix_dir')"
+  log "  proton.dir=$(dirname "$PROTON_BIN") source=$(cfg_source_or_unknown 'proton.dir')"
   log "  edcopilot.enabled=$EDCOPILOT_ENABLED source=$(cfg_source_or_unknown 'edcopilot.enabled')"
   log "  edcopilot.exe=$EDCOPILOT_EXE source=$(cfg_source_or_unknown 'edcopilot.exe')"
   log "  edcopilot.mode=$EDCOPILOT_MODE source=$(cfg_source_or_unknown 'edcopilot.mode')"
@@ -353,14 +359,81 @@ resolve_runtime_client_from_processes() {
   printf '%s' "$candidate"
 }
 
-find_proton() {
+normalize_path() {
+  local p="$1"
+  p="${p/#\~/$HOME}"
+  printf '%s' "$p"
+}
+
+find_newest_matching_path() {
+  local pattern="$1"
+  local candidate="" newest="" newest_mtime="0" mtime
+
+  for candidate in $pattern; do
+    [[ -e "$candidate" ]] || continue
+    mtime="$(stat -c '%Y' "$candidate" 2>/dev/null || echo 0)"
+    if (( mtime >= newest_mtime )); then
+      newest="$candidate"
+      newest_mtime="$mtime"
+    fi
+  done
+
+  [[ -n "$newest" ]] || return 1
+  printf '%s' "$newest"
+}
+
+find_proton_dir() {
   local steam_root="$1" p
-  p="$(ls -1d "$steam_root"/steamapps/common/Proton*/proton 2>/dev/null | head -n1 || true)"
-  [[ -n "$p" && -x "$p" ]] && { printf '%s' "$p"; return 0; }
-  p="$(ls -1d "$HOME"/.steam/steam/compatibilitytools.d/*/proton 2>/dev/null | head -n1 || true)"
-  [[ -n "$p" && -x "$p" ]] && { printf '%s' "$p"; return 0; }
+
+  p="$(find_newest_matching_path "$HOME/.steam/steam/compatibilitytools.d/*" || true)"
+  [[ -n "$p" && -x "$p/proton" ]] && { printf '%s' "$p"; return 0; }
+
+  p="$(find_newest_matching_path "$steam_root/steamapps/common/Proton*" || true)"
+  [[ -n "$p" && -x "$p/proton" ]] && { printf '%s' "$p"; return 0; }
+
   return 1
 }
+
+resolve_prefix_dir_from_processes() {
+  local pid env_file env_entry compat_data prefix
+
+  while IFS= read -r pid; do
+    env_file="/proc/$pid/environ"
+    [[ -r "$env_file" ]] || continue
+    while IFS= read -r -d '' env_entry; do
+      case "$env_entry" in
+        WINEPREFIX=*)
+          prefix="${env_entry#WINEPREFIX=}"
+          prefix="$(normalize_path "$prefix")"
+          [[ -d "$prefix" ]] && { printf '%s' "$prefix"; return 0; }
+          ;;
+        STEAM_COMPAT_DATA_PATH=*)
+          compat_data="${env_entry#STEAM_COMPAT_DATA_PATH=}"
+          compat_data="$(normalize_path "$compat_data")"
+          [[ -d "$compat_data/pfx" ]] && { printf '%s' "$compat_data/pfx"; return 0; }
+          ;;
+      esac
+    done < "$env_file"
+  done < <(pgrep -f 'EliteDangerous64\.exe|MinEdLauncher|EDLaunch\.exe' 2>/dev/null || true)
+
+  return 1
+}
+
+resolve_proton_dir_from_processes() {
+  local line proton_bin
+
+  line="$(pgrep -fa 'Proton[^[:space:]]*/proton.*(EliteDangerous64\.exe|MinEdLauncher|EDLaunch\.exe)' 2>/dev/null | head -n1 || true)"
+  [[ -z "$line" ]] && return 1
+
+  proton_bin="$(printf '%s
+' "$line" | sed -n 's#.*\(/[^[:space:]]*Proton[^[:space:]]*/proton\).*#\1#p')"
+  [[ -z "$proton_bin" ]] && return 1
+
+  proton_bin="$(normalize_path "$proton_bin")"
+  [[ -x "$proton_bin" ]] || return 1
+  dirname "$proton_bin"
+}
+
 
 wait_for_process_any() {
   local timeout="$1"; shift
@@ -1417,6 +1490,14 @@ build_game_command() {
 }
 
 ini_load "$CONFIG_PATH"
+if [[ -n "$CLI_PREFIX_DIR" ]]; then
+  CFG['steam.prefix_dir']="$CLI_PREFIX_DIR"
+  CFG_SOURCE['steam.prefix_dir']="cli"
+fi
+if [[ -n "$CLI_PROTON_DIR" ]]; then
+  CFG['proton.dir']="$CLI_PROTON_DIR"
+  CFG_SOURCE['proton.dir']="cli"
+fi
 log_loaded_config
 
 if [[ "$SELF_TEST" -eq 1 ]]; then
@@ -1480,13 +1561,33 @@ phase_end "bootstrap"
 phase_start "detect steam/prefix/runtime"
 debug "CLI modes: NO_GAME=$NO_GAME WAIT_TOOLS=$WAIT_TOOLS NO_GAME_TOOL_MODE=$NO_GAME_TOOL_MODE DRY_RUN=$DRY_RUN PASS_COMMAND=$PASS_COMMAND"
 detected_bus_name=""
-set_var STEAM_ROOT "$(cfg_get 'steam.steam_root' '')"
+set_var STEAM_ROOT "$(expand_tokens "$(cfg_get 'steam.steam_root' '')")"
 [[ -z "$STEAM_ROOT" ]] && set_var STEAM_ROOT "$(detect_steam_root || true)"
 [[ -n "$STEAM_ROOT" && -d "$STEAM_ROOT" ]] || { phase_fail "detect steam/prefix/runtime" "steam root not found"; die "steam root not found"; }
-set_var COMPATDATA_DIR "$(cfg_get 'steam.compatdata_dir' "${STEAM_COMPAT_DATA_PATH:-$STEAM_ROOT/steamapps/compatdata/$APPID}")"
-set_var WINEPREFIX "$COMPATDATA_DIR/pfx"
+
+set_var COMPATDATA_DIR "$(expand_tokens "$(cfg_get 'steam.compatdata_dir' "${STEAM_COMPAT_DATA_PATH:-$STEAM_ROOT/steamapps/compatdata/$APPID}")")"
+
+prefix_dir_candidate="$(expand_tokens "$(cfg_get 'steam.prefix_dir' '')")"
+if [[ -n "$prefix_dir_candidate" ]]; then
+  prefix_dir_candidate="$(normalize_path "$prefix_dir_candidate")"
+  CFG_SOURCE['steam.prefix_dir']="${CFG_SOURCE['steam.prefix_dir']:-config:steam.prefix_dir}"
+  set_var WINEPREFIX "$prefix_dir_candidate"
+elif [[ -d "$COMPATDATA_DIR/pfx" ]]; then
+  set_var WINEPREFIX "$COMPATDATA_DIR/pfx"
+  CFG_SOURCE['steam.prefix_dir']="default:steam.compatdata_dir/pfx"
+else
+  set_var WINEPREFIX "$(resolve_prefix_dir_from_processes || true)"
+  if [[ -n "$WINEPREFIX" ]]; then
+    CFG_SOURCE['steam.prefix_dir']="detected:process-env"
+  fi
+fi
 [[ -d "$WINEPREFIX" ]] || { phase_fail "detect steam/prefix/runtime" "wineprefix not found"; die "WINEPREFIX not found: $WINEPREFIX"; }
-set_var RUNTIME_CLIENT "$(cfg_get 'steam.runtime_client' '')"
+
+if [[ "$WINEPREFIX" == */pfx ]]; then
+  set_var COMPATDATA_DIR "${WINEPREFIX%/pfx}"
+fi
+
+set_var RUNTIME_CLIENT "$(expand_tokens "$(cfg_get 'steam.runtime_client' '')")"
 [[ -z "$RUNTIME_CLIENT" ]] && set_var RUNTIME_CLIENT "$(detect_runtime_client "$STEAM_ROOT" || true)"
 set_var RUNTIME_CLIENT_READY "false"
 if [[ -n "$RUNTIME_CLIENT" && -x "$RUNTIME_CLIENT" ]]; then
@@ -1507,8 +1608,27 @@ if [[ "$NO_GAME_TOOL_MODE" -eq 1 ]]; then
   set_var RUNTIME_CLIENT_READY "false"
   log "No-game tool mode active: forcing Proton tool launches without Steam app bus attach"
 fi
-set_var PROTON_BIN "$(cfg_get 'proton.proton' '')"
-[[ -z "$PROTON_BIN" ]] && set_var PROTON_BIN "$(find_proton "$STEAM_ROOT" || true)"
+proton_dir_candidate="$(expand_tokens "$(cfg_get 'proton.dir' '')")"
+if [[ -n "$proton_dir_candidate" ]]; then
+  proton_dir_candidate="$(normalize_path "$proton_dir_candidate")"
+  CFG_SOURCE['proton.dir']="${CFG_SOURCE['proton.dir']:-config:proton.dir}"
+  set_var PROTON_BIN "$proton_dir_candidate/proton"
+else
+  set_var PROTON_BIN "$(expand_tokens "$(cfg_get 'proton.proton' '')")"
+  if [[ -n "$PROTON_BIN" ]]; then
+    CFG_SOURCE['proton.dir']="compat:proton.proton"
+  else
+    detected_proton_dir="$(resolve_proton_dir_from_processes || true)"
+    if [[ -n "$detected_proton_dir" ]]; then
+      set_var PROTON_BIN "$detected_proton_dir/proton"
+      CFG_SOURCE['proton.dir']="detected:process-cmd"
+    else
+      detected_proton_dir="$(find_proton_dir "$STEAM_ROOT" || true)"
+      [[ -n "$detected_proton_dir" ]] && set_var PROTON_BIN "$detected_proton_dir/proton"
+      [[ -n "$detected_proton_dir" ]] && CFG_SOURCE['proton.dir']="detected:filesystem"
+    fi
+  fi
+fi
 [[ -n "$PROTON_BIN" && -x "$PROTON_BIN" ]] || { phase_fail "detect steam/prefix/runtime" "proton not found"; die "proton not found"; }
 set_var WINELOADER "$(dirname "$PROTON_BIN")/files/bin/wine"
 set_var EDCOPILOT_EXE "$(cfg_get 'edcopilot.exe' '')"
