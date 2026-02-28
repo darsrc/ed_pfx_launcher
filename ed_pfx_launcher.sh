@@ -594,10 +594,82 @@ pick_one() {
   done
 }
 
+render_interactive_menu() {
+  local label="$1" selected="$2"
+  shift 2
+  local -a choices=("$@")
+  local idx
+
+  printf '\r\033[J'
+  printf '%s\n' "$label"
+  printf '  Use ↑/↓ (or j/k), Enter to confirm, q to cancel.\n\n'
+
+  for idx in "${!choices[@]}"; do
+    if (( idx == selected )); then
+      printf '  ❯ %s\n' "${choices[$idx]}"
+    else
+      printf '    %s\n' "${choices[$idx]}"
+    fi
+  done
+}
+
+prompt_selection_tui() {
+  local label="$1"
+  shift
+  local -a choices=("$@")
+  local count="${#choices[@]}"
+  local selected=0 key
+
+  (( count > 0 )) || return 1
+  [[ -t 0 && -t 1 ]] || return 1
+
+  tput civis 2>/dev/null || true
+  trap 'tput cnorm 2>/dev/null || true' RETURN
+
+  render_interactive_menu "$label" "$selected" "${choices[@]}"
+  while true; do
+    IFS= read -rsn1 key || return 1
+    case "$key" in
+      "")
+        printf '\n'
+        printf '%s' "${choices[$selected]}"
+        return 0
+        ;;
+      q|Q)
+        printf '\n'
+        return 1
+        ;;
+      k)
+        selected=$(((selected - 1 + count) % count))
+        ;;
+      j)
+        selected=$(((selected + 1) % count))
+        ;;
+      $'\x1b')
+        IFS= read -rsn1 -t 0.05 key || continue
+        [[ "$key" == "[" ]] || continue
+        IFS= read -rsn1 -t 0.05 key || continue
+        case "$key" in
+          A) selected=$(((selected - 1 + count) % count)) ;;
+          B) selected=$(((selected + 1) % count)) ;;
+        esac
+        ;;
+    esac
+
+    render_interactive_menu "$label" "$selected" "${choices[@]}"
+  done
+}
+
 prompt_selection() {
   local label="$1"
   shift
-  pick_one "$label" "$@"
+  local -a choices=("$@")
+
+  if prompt_selection_tui "$label" "${choices[@]}"; then
+    return 0
+  fi
+
+  pick_one "$label" "${choices[@]}"
 }
 
 write_config_value() {
@@ -751,93 +823,6 @@ detect_proton_candidates() {
   printf '%s\n' "${unique[@]}"
 }
 
-prompt_selection() {
-  local label="$1"
-  shift
-  local -a choices=("$@")
-  local count="${#choices[@]}" reply
-
-  (( count > 0 )) || return 1
-
-  echo
-  echo "$label"
-  local idx
-  for idx in "${!choices[@]}"; do
-    echo "  $((idx + 1))) ${choices[$idx]}"
-  done
-
-  while true; do
-    read -r -p "Select [1-$count]: " reply
-    if [[ "$reply" =~ ^[0-9]+$ ]] && (( reply >= 1 && reply <= count )); then
-      printf '%s' "${choices[$((reply - 1))]}"
-      return 0
-    fi
-    echo "Invalid selection '$reply'. Please choose 1-$count." >&2
-  done
-}
-
-write_config_value() {
-  local section="$1" key="$2" value="$3" file="$4"
-  python3 - "$file" "$section" "$key" "$value" <<'PY'
-from pathlib import Path
-import sys
-
-file_path = Path(sys.argv[1])
-section = sys.argv[2].lower()
-key = sys.argv[3].lower()
-value = sys.argv[4]
-
-text = file_path.read_text(encoding='utf-8')
-lines = text.splitlines(keepends=True)
-
-def normalize_newline(lines):
-    if not lines:
-        return '\n'
-    return '\r\n' if any(line.endswith('\r\n') for line in lines) else '\n'
-
-newline = normalize_newline(lines)
-section_start = None
-section_end = len(lines)
-for i, line in enumerate(lines):
-    stripped = line.strip()
-    if stripped.startswith('[') and stripped.endswith(']'):
-        current = stripped[1:-1].strip().lower()
-        if section_start is None:
-            if current == section:
-                section_start = i
-        elif i > section_start:
-            section_end = i
-            break
-
-entry = f"{key}={value}{newline}"
-if section_start is None:
-    if lines and not lines[-1].endswith(('\n', '\r')):
-        lines[-1] += newline
-    if lines and lines[-1].strip():
-        lines.append(newline)
-    lines.append(f"[{section}]{newline}")
-    lines.append(entry)
-else:
-    key_line = None
-    for i in range(section_start + 1, section_end):
-        stripped = lines[i].strip()
-        if not stripped or stripped.startswith(';') or stripped.startswith('#') or '=' not in stripped:
-            continue
-        existing_key = stripped.split('=', 1)[0].strip().lower()
-        if existing_key == key:
-            key_line = i
-            break
-    if key_line is None:
-        insert_at = section_end
-        while insert_at > section_start + 1 and not lines[insert_at - 1].strip():
-            insert_at -= 1
-        lines.insert(insert_at, entry)
-    else:
-        lines[key_line] = entry
-
-file_path.write_text(''.join(lines), encoding='utf-8')
-PY
-}
 
 interactive_configure_paths() {
   local steam_root="$1"
