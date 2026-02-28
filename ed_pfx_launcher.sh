@@ -321,14 +321,18 @@ log_effective_config() {
   log "  audio.pulse_latency_msec=$PULSE_LATENCY_MSEC source=$(cfg_source_or_unknown 'audio.pulse_latency_msec')"
 }
 
-expand_tokens() {
+safe_expand_tokens() {
   local s="$1"
-  s="${s//\{home\}/$HOME}"
-  s="${s//\{appid\}/$APPID}"
-  s="${s//\{steam_root\}/$STEAM_ROOT}"
-  s="${s//\{compatdata\}/$COMPATDATA_DIR}"
-  s="${s//\{prefix\}/$WINEPREFIX}"
+  s="${s//\{home\}/${HOME:-}}"
+  s="${s//\{appid\}/${APPID:-}}"
+  s="${s//\{steam_root\}/${STEAM_ROOT:-}}"
+  s="${s//\{compatdata\}/${COMPATDATA_DIR:-}}"
+  s="${s//\{prefix\}/${WINEPREFIX:-}}"
   printf '%s' "$s"
+}
+
+expand_tokens() {
+  safe_expand_tokens "$1"
 }
 
 detect_steam_root() {
