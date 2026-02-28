@@ -813,6 +813,165 @@ file_path.write_text(''.join(lines), encoding='utf-8')
 PY
 }
 
+commit_interactive_config_changes() {
+  local file="$1" selected_prefix="$2" selected_proton_dir="$3"
+  local config_dir config_base tmp_file backup_file timestamp commit_state
+
+  [[ -f "$file" ]] || {
+    log "Interactive save rollback/error: config file not found at $file"
+    return 1
+  }
+
+  config_dir="$(dirname "$file")"
+  config_base="$(basename "$file")"
+  tmp_file="$(mktemp "$config_dir/.${config_base}.tmp.XXXXXX")"
+
+  if ! commit_state="$({
+    python3 - "$file" "$tmp_file" "$selected_prefix" "$selected_proton_dir" <<'PY'
+from pathlib import Path
+import sys
+
+file_path = Path(sys.argv[1])
+tmp_path = Path(sys.argv[2])
+selected_prefix = sys.argv[3]
+selected_proton_dir = sys.argv[4]
+
+text = file_path.read_text(encoding='utf-8')
+lines = text.splitlines(keepends=True)
+
+def normalize_newline(lines):
+    if not lines:
+        return '\n'
+    return '\r\n' if any(line.endswith('\r\n') for line in lines) else '\n'
+
+def parse_ini(lines):
+    data = {}
+    section = None
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith(';') or stripped.startswith('#'):
+            continue
+        if stripped.startswith('[') and stripped.endswith(']'):
+            section = stripped[1:-1].strip().lower()
+            data.setdefault(section, {})
+            continue
+        if '=' not in stripped or section is None:
+            continue
+        key, value = stripped.split('=', 1)
+        data.setdefault(section, {})[key.strip().lower()] = value.strip()
+    return data
+
+def set_value(lines, section, key, value, newline):
+    section_start = None
+    section_end = len(lines)
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith('[') and stripped.endswith(']'):
+            current = stripped[1:-1].strip().lower()
+            if section_start is None:
+                if current == section:
+                    section_start = i
+            elif i > section_start:
+                section_end = i
+                break
+
+    entry = f"{key}={value}{newline}"
+    if section_start is None:
+        if lines and not lines[-1].endswith(('\n', '\r')):
+            lines[-1] += newline
+        if lines and lines[-1].strip():
+            lines.append(newline)
+        lines.append(f"[{section}]{newline}")
+        lines.append(entry)
+        return
+
+    key_line = None
+    for i in range(section_start + 1, section_end):
+        stripped = lines[i].strip()
+        if not stripped or stripped.startswith(';') or stripped.startswith('#') or '=' not in stripped:
+            continue
+        existing_key = stripped.split('=', 1)[0].strip().lower()
+        if existing_key == key:
+            key_line = i
+            break
+
+    if key_line is None:
+        insert_at = section_end
+        while insert_at > section_start + 1 and not lines[insert_at - 1].strip():
+            insert_at -= 1
+        lines.insert(insert_at, entry)
+    else:
+        lines[key_line] = entry
+
+existing = parse_ini(lines)
+changes = {
+    ('steam', 'prefix_dir'): selected_prefix,
+    ('proton', 'dir'): selected_proton_dir,
+}
+noop = True
+for (section, key), value in changes.items():
+    if existing.get(section, {}).get(key) != value:
+        noop = False
+        break
+
+if noop:
+    print('noop')
+    sys.exit(0)
+
+new_lines = list(lines)
+newline = normalize_newline(new_lines)
+for (section, key), value in changes.items():
+    set_value(new_lines, section, key, value, newline)
+
+updated = parse_ini(new_lines)
+required = {
+    'steam': {'prefix_dir'},
+    'proton': {'dir'},
+}
+for section, keys in required.items():
+    if section not in updated:
+        raise SystemExit(f"validation failed: missing [{section}] section")
+    missing = [k for k in keys if not updated[section].get(k)]
+    if missing:
+        raise SystemExit(f"validation failed: missing keys in [{section}]: {', '.join(missing)}")
+
+tmp_path.write_text(''.join(new_lines), encoding='utf-8')
+print('changed')
+PY
+  } 2>&1)"; then
+    rm -f -- "$tmp_file"
+    log "Interactive save rollback/error: failed to prepare updated config ($commit_state)"
+    return 1
+  fi
+
+  if [[ "$commit_state" == "noop" ]]; then
+    rm -f -- "$tmp_file"
+    log "Interactive save no-op: selected values already match $file"
+    return 0
+  fi
+
+  timestamp="$(date +%Y%m%d%H%M%S)"
+  backup_file="$file.bak-$timestamp"
+  if ! cp -p -- "$file" "$backup_file"; then
+    rm -f -- "$tmp_file"
+    log "Interactive save rollback/error: could not create backup at $backup_file"
+    return 1
+  fi
+
+  if mv -f -- "$tmp_file" "$file"; then
+    log "Interactive save committed successfully to $file (backup: $backup_file)"
+    return 0
+  fi
+
+  rm -f -- "$tmp_file"
+  if cp -p -- "$backup_file" "$file"; then
+    log "Interactive save rollback/error: atomic replace failed; restored original from $backup_file"
+  else
+    log "Interactive save rollback/error: atomic replace failed and restore from $backup_file also failed"
+  fi
+  return 1
+}
+
 detect_prefix_candidates() {
   local steam_root="$1" appid="$2" preferred_base="$3"
   local -a compat_roots=() prefix_candidates=()
@@ -1017,8 +1176,10 @@ interactive_wizard_run() {
   selected_prefix="${wizard_state[selected_prefix]}"
   selected_proton="${wizard_state[selected_proton]}"
 
-  write_config_value "steam" "prefix_dir" "$selected_prefix" "$CONFIG_PATH"
-  write_config_value "proton" "dir" "$(dirname "$selected_proton")" "$CONFIG_PATH"
+  if ! commit_interactive_config_changes "$CONFIG_PATH" "$selected_prefix" "$(dirname "$selected_proton")"; then
+    warn "Interactive wizard save failed; leaving configuration unchanged"
+    return 1
+  fi
 
   CFG['steam.prefix_dir']="$selected_prefix"
   CFG['proton.dir']="$(dirname "$selected_proton")"
@@ -1027,8 +1188,8 @@ interactive_wizard_run() {
   PREFIX_DIR="$selected_prefix"
   PROTON_DIR="$(dirname "$selected_proton")"
 
-  log "Saved steam.prefix_dir=$selected_prefix to $CONFIG_PATH"
-  log "Saved proton.dir=$(dirname "$selected_proton") to $CONFIG_PATH"
+  log "Interactive selection applied: steam.prefix_dir=$selected_prefix"
+  log "Interactive selection applied: proton.dir=$(dirname "$selected_proton")"
 }
 
 wait_for_process_any() {
