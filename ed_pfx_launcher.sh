@@ -663,6 +663,182 @@ file_path.write_text(''.join(lines), encoding='utf-8')
 PY
 }
 
+detect_prefix_candidates() {
+  local steam_root="$1" appid="$2" preferred_base="$3"
+  local -a compat_roots=() prefix_candidates=()
+  local root dir normalized
+
+  if [[ -n "${STEAM_COMPAT_DATA_PATH:-}" ]]; then
+    normalized="$(normalize_prefix_dir "$STEAM_COMPAT_DATA_PATH")"
+    if [[ -d "$normalized/pfx" ]]; then
+      prefix_candidates+=("$normalized")
+    fi
+  fi
+
+  if [[ -n "$preferred_base" ]]; then
+    compat_roots+=("$preferred_base")
+  fi
+  compat_roots+=(
+    "$steam_root/steamapps/compatdata"
+    "$HOME/.local/share/Steam/steamapps/compatdata"
+    "$HOME/.steam/debian-installation/steamapps/compatdata"
+    "$HOME/.steam/steam/steamapps/compatdata"
+  )
+
+  for root in "${compat_roots[@]}"; do
+    [[ -d "$root" ]] || continue
+
+    dir="$root/$appid"
+    [[ -d "$dir/pfx" ]] && prefix_candidates+=("$dir")
+
+    for dir in "$root"/*; do
+      [[ -d "$dir/pfx" ]] && prefix_candidates+=("$dir")
+    done
+  done
+
+  local -A seen=()
+  local -a unique=()
+  for dir in "${prefix_candidates[@]}"; do
+    normalized="$(normalize_prefix_dir "$dir")"
+    [[ -d "$normalized/pfx" ]] || continue
+    if [[ -z "${seen[$normalized]+x}" ]]; then
+      seen["$normalized"]=1
+      unique+=("$normalized")
+    fi
+  done
+
+  printf '%s\n' "${unique[@]}"
+}
+
+detect_proton_candidates() {
+  local steam_root="$1" proton_dir="$2"
+  local -a bases=() candidates=()
+  local base p
+
+  if [[ -n "$proton_dir" ]]; then
+    bases+=("$proton_dir")
+  fi
+
+  bases+=(
+    "$steam_root/steamapps/common"
+    "$HOME/.steam/steam/compatibilitytools.d"
+    "$HOME/.steam/debian-installation/compatibilitytools.d"
+    "$HOME/.local/share/Steam/compatibilitytools.d"
+  )
+
+  for base in "${bases[@]}"; do
+    [[ -d "$base" ]] || continue
+
+    if [[ -x "$base/proton" ]]; then
+      candidates+=("$base/proton")
+      continue
+    fi
+
+    for p in "$base"/Proton*/proton "$base"/*/proton; do
+      [[ -x "$p" ]] && candidates+=("$p")
+    done
+  done
+
+  local -A seen=()
+  local -a unique=()
+  for p in "${candidates[@]}"; do
+    if [[ -z "${seen[$p]+x}" ]]; then
+      seen["$p"]=1
+      unique+=("$p")
+    fi
+  done
+
+  printf '%s\n' "${unique[@]}"
+}
+
+prompt_selection() {
+  local label="$1"
+  shift
+  local -a choices=("$@")
+  local count="${#choices[@]}" reply
+
+  (( count > 0 )) || return 1
+
+  echo
+  echo "$label"
+  local idx
+  for idx in "${!choices[@]}"; do
+    echo "  $((idx + 1))) ${choices[$idx]}"
+  done
+
+  while true; do
+    read -r -p "Select [1-$count]: " reply
+    if [[ "$reply" =~ ^[0-9]+$ ]] && (( reply >= 1 && reply <= count )); then
+      printf '%s' "${choices[$((reply - 1))]}"
+      return 0
+    fi
+    echo "Invalid selection '$reply'. Please choose 1-$count." >&2
+  done
+}
+
+write_config_value() {
+  local section="$1" key="$2" value="$3" file="$4"
+  python3 - "$file" "$section" "$key" "$value" <<'PY'
+from pathlib import Path
+import sys
+
+file_path = Path(sys.argv[1])
+section = sys.argv[2].lower()
+key = sys.argv[3].lower()
+value = sys.argv[4]
+
+text = file_path.read_text(encoding='utf-8')
+lines = text.splitlines(keepends=True)
+
+def normalize_newline(lines):
+    if not lines:
+        return '\n'
+    return '\r\n' if any(line.endswith('\r\n') for line in lines) else '\n'
+
+newline = normalize_newline(lines)
+section_start = None
+section_end = len(lines)
+for i, line in enumerate(lines):
+    stripped = line.strip()
+    if stripped.startswith('[') and stripped.endswith(']'):
+        current = stripped[1:-1].strip().lower()
+        if section_start is None:
+            if current == section:
+                section_start = i
+        elif i > section_start:
+            section_end = i
+            break
+
+entry = f"{key}={value}{newline}"
+if section_start is None:
+    if lines and not lines[-1].endswith(('\n', '\r')):
+        lines[-1] += newline
+    if lines and lines[-1].strip():
+        lines.append(newline)
+    lines.append(f"[{section}]{newline}")
+    lines.append(entry)
+else:
+    key_line = None
+    for i in range(section_start + 1, section_end):
+        stripped = lines[i].strip()
+        if not stripped or stripped.startswith(';') or stripped.startswith('#') or '=' not in stripped:
+            continue
+        existing_key = stripped.split('=', 1)[0].strip().lower()
+        if existing_key == key:
+            key_line = i
+            break
+    if key_line is None:
+        insert_at = section_end
+        while insert_at > section_start + 1 and not lines[insert_at - 1].strip():
+            insert_at -= 1
+        lines.insert(insert_at, entry)
+    else:
+        lines[key_line] = entry
+
+file_path.write_text(''.join(lines), encoding='utf-8')
+PY
+}
+
 interactive_configure_paths() {
   local steam_root="$1"
   local appid="$2"
@@ -698,6 +874,7 @@ interactive_configure_paths() {
   log "Saved steam.prefix_dir=$selected_prefix to $CONFIG_PATH"
   log "Saved proton.dir=$(dirname "$selected_proton") to $CONFIG_PATH"
 }
+
 wait_for_process_any() {
   local timeout="$1"; shift
   local i=0 p
