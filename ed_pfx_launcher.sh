@@ -306,6 +306,8 @@ log_effective_config() {
   log "  resolved.proton_bin=$PROTON_BIN"
   log "  elite.launcher_preference=$LAUNCHER_PREFERENCE source=$(cfg_source_or_unknown 'elite.launcher_preference')"
   log "  elite.pass_command=$PASS_COMMAND source=$(cfg_source_or_unknown 'elite.pass_command')"
+  log "  steam.prefix_dir=$WINEPREFIX source=$(cfg_source_or_unknown 'steam.prefix_dir')"
+  log "  proton.dir=$(dirname "$PROTON_BIN") source=$(cfg_source_or_unknown 'proton.dir')"
   log "  edcopilot.enabled=$EDCOPILOT_ENABLED source=$(cfg_source_or_unknown 'edcopilot.enabled')"
   log "  edcopilot.exe=$EDCOPILOT_EXE source=$(cfg_source_or_unknown 'edcopilot.exe')"
   log "  edcopilot.mode=$EDCOPILOT_MODE source=$(cfg_source_or_unknown 'edcopilot.mode')"
@@ -1555,6 +1557,14 @@ build_game_command() {
 }
 
 ini_load "$CONFIG_PATH"
+if [[ -n "$CLI_PREFIX_DIR" ]]; then
+  CFG['steam.prefix_dir']="$CLI_PREFIX_DIR"
+  CFG_SOURCE['steam.prefix_dir']="cli"
+fi
+if [[ -n "$CLI_PROTON_DIR" ]]; then
+  CFG['proton.dir']="$CLI_PROTON_DIR"
+  CFG_SOURCE['proton.dir']="cli"
+fi
 log_loaded_config
 
 if [[ "$SELF_TEST" -eq 1 ]]; then
@@ -1656,7 +1666,7 @@ phase_end "bootstrap"
 phase_start "detect steam/prefix/runtime"
 debug "CLI modes: NO_GAME=$NO_GAME WAIT_TOOLS=$WAIT_TOOLS NO_GAME_TOOL_MODE=$NO_GAME_TOOL_MODE DRY_RUN=$DRY_RUN PASS_COMMAND=$PASS_COMMAND"
 detected_bus_name=""
-set_var STEAM_ROOT "$(cfg_get 'steam.steam_root' '')"
+set_var STEAM_ROOT "$(expand_tokens "$(cfg_get 'steam.steam_root' '')")"
 [[ -z "$STEAM_ROOT" ]] && set_var STEAM_ROOT "$(detect_steam_root || true)"
 [[ -n "$STEAM_ROOT" && -d "$STEAM_ROOT" ]] || { phase_fail "detect steam/prefix/runtime" "steam root not found"; die "steam root not found"; }
 if [[ -n "$PREFIX_DIR" ]]; then
