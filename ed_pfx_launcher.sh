@@ -305,9 +305,12 @@ log_effective_config() {
   log "  interactive.ui=$INTERACTIVE_UI source=$(cfg_source_or_unknown 'interactive.ui')"
   log "  resolved.prefix_dir=$PREFIX_DIR"
   log "  resolved.proton_bin=$PROTON_BIN"
+  log "  resolved.game_wineprefix=$GAME_WINEPREFIX source=$(cfg_source_or_unknown 'instances.game_prefix_dir')"
+  log "  resolved.edcopilot_wineprefix=$EDCOPILOT_WINEPREFIX source=$(cfg_source_or_unknown 'instances.edcopilot_prefix_dir')"
+  log "  resolved.edcopter_wineprefix=$EDCOPTER_WINEPREFIX source=$(cfg_source_or_unknown 'instances.edcopter_prefix_dir')"
+  log "  resolved.tool_wineprefix=$TOOL_WINEPREFIX source=$(cfg_source_or_unknown 'instances.tool_prefix_dir')"
   log "  elite.launcher_preference=$LAUNCHER_PREFERENCE source=$(cfg_source_or_unknown 'elite.launcher_preference')"
   log "  elite.pass_command=$PASS_COMMAND source=$(cfg_source_or_unknown 'elite.pass_command')"
-  log "  steam.prefix_dir=$WINEPREFIX source=$(cfg_source_or_unknown 'steam.prefix_dir')"
   log "  proton.dir=$(dirname "$PROTON_BIN") source=$(cfg_source_or_unknown 'proton.dir')"
   log "  edcopilot.enabled=$EDCOPILOT_ENABLED source=$(cfg_source_or_unknown 'edcopilot.enabled')"
   log "  edcopilot.exe=$EDCOPILOT_EXE source=$(cfg_source_or_unknown 'edcopilot.exe')"
@@ -330,7 +333,7 @@ safe_expand_tokens() {
   s="${s//\{appid\}/${APPID:-}}"
   s="${s//\{steam_root\}/${STEAM_ROOT:-}}"
   s="${s//\{compatdata\}/${COMPATDATA_DIR:-}}"
-  s="${s//\{prefix\}/${WINEPREFIX:-}}"
+  s="${s//\{prefix\}/${GAME_WINEPREFIX:-${WINEPREFIX:-}}}"
   printf '%s' "$s"
 }
 
@@ -1746,6 +1749,12 @@ launch_wine_child() {
   debug "child[$label] started pid=$! log=$log_file"
 }
 
+with_wineprefix_env() {
+  local wineprefix="$1"
+  shift
+  env "WINEPREFIX=$wineprefix" "$@"
+}
+
 log_edcopilot_tail() {
   local log_file="$LOG_DIR/edcopilot.log"
   if [[ -f "$log_file" ]]; then
@@ -1857,7 +1866,7 @@ build_edcopilot_env_args() {
   local default_winedebug='-all,+seh,+err,+mscoree,+loaddll'
 
   EDCOPILOT_ENV_ARGS=(
-    "WINEPREFIX=$WINEPREFIX"
+    "WINEPREFIX=$EDCOPILOT_WINEPREFIX"
     "WINEFSYNC=1"
     "WINEESYNC=1"
     "SDL_JOYSTICK_DISABLE=1"
@@ -1948,8 +1957,8 @@ is_edcopilot_tool_binary() {
 apply_edcopilot_hotas_fix() {
   [[ "$EDCOPILOT_HOTAS_FIX" == "true" ]] || return 0
 
-  debug_cmd "edcopilot hotas fix registry" "$WINELOADER" reg add 'HKCU\\Software\\Wine\\DllOverrides' /v windows.gaming.input /t REG_SZ /d '' /f
-  "$WINELOADER" reg add 'HKCU\Software\Wine\DllOverrides' /v windows.gaming.input /t REG_SZ /d '' /f >/dev/null 2>&1 \
+  debug_cmd "edcopilot hotas fix registry" env "WINEPREFIX=$EDCOPILOT_WINEPREFIX" "$WINELOADER" reg add 'HKCU\\Software\\Wine\\DllOverrides' /v windows.gaming.input /t REG_SZ /d '' /f
+  env "WINEPREFIX=$EDCOPILOT_WINEPREFIX" "$WINELOADER" reg add 'HKCU\Software\Wine\DllOverrides' /v windows.gaming.input /t REG_SZ /d '' /f >/dev/null 2>&1 \
     || warn "Failed to apply EDCoPilot HOTAS registry override"
 }
 
@@ -2160,7 +2169,7 @@ launch_tool() {
       launch_wine_child "$label" env "${EDCOPILOT_ENV_ARGS[@]}" "$WINELOADER" "$tool_path"
     else
       log "Launching tool '$label' via Proton (no-game tool mode)"
-      launch_wine_child "$label" "$PROTON_BIN" run "$tool_path"
+      launch_wine_child "$label" with_wineprefix_env "$TOOL_WINEPREFIX" "$PROTON_BIN" run "$tool_path"
     fi
     return 0
   fi
@@ -2175,7 +2184,7 @@ launch_tool() {
         build_edcopilot_env_args
         launch_wine_child "$label" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- env "${EDCOPILOT_ENV_ARGS[@]}" "$WINELOADER" "$tool_path"
       else
-        launch_wine_child "$label" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- "$WINELOADER" "$tool_path"
+        launch_wine_child "$label" with_wineprefix_env "$TOOL_WINEPREFIX" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- "$WINELOADER" "$tool_path"
       fi
       return 0
     fi
@@ -2187,7 +2196,7 @@ launch_tool() {
     build_edcopilot_env_args
     launch_wine_child "$label" env "${EDCOPILOT_ENV_ARGS[@]}" "$WINELOADER" "$tool_path"
   else
-    launch_wine_child "$label" "$PROTON_BIN" run "$tool_path"
+    launch_wine_child "$label" with_wineprefix_env "$TOOL_WINEPREFIX" "$PROTON_BIN" run "$tool_path"
   fi
 }
 
@@ -2401,6 +2410,10 @@ EDCOPILOT_FORCE_LINUX_FLAG="$(cfg_bool 'edcopilot.force_linux_flag' 'true')"
 cfg_assign_select_int LAUNCHER_DETECT_TIMEOUT 'detection.launcher_timeout' '120' '1' 'detection.launcher_timeout' 'elite.launcher_detect_timeout'
 cfg_assign_select_int GAME_DETECT_TIMEOUT 'detection.game_timeout' '120' '1' 'detection.game_timeout' 'elite.game_detect_timeout'
 cfg_assign_select PREFIX_DIR 'steam.prefix_dir' '' 'steam.prefix_dir' 'steam.compatdata_dir'
+cfg_assign_select GAME_PREFIX_DIR 'instances.game_prefix_dir' '' 'instances.game_prefix_dir' 'steam.prefix_dir'
+cfg_assign_select EDCOPILOT_PREFIX_DIR 'instances.edcopilot_prefix_dir' '' 'instances.edcopilot_prefix_dir' 'steam.prefix_dir'
+cfg_assign_select EDCOPTER_PREFIX_DIR 'instances.edcopter_prefix_dir' '' 'instances.edcopter_prefix_dir' 'steam.prefix_dir'
+cfg_assign_select TOOL_PREFIX_DIR 'instances.tool_prefix_dir' '' 'instances.tool_prefix_dir' 'steam.prefix_dir'
 cfg_assign_select PREFIX_SELECT 'steam.prefix_select' 'first' 'steam.prefix_select'
 PREFIX_SELECT="${PREFIX_SELECT,,}"
 case "$PREFIX_SELECT" in
@@ -2500,6 +2513,31 @@ fi
 [[ -n "$PREFIX_DIR" && -d "$PREFIX_DIR/pfx" ]] || { phase_fail "detect steam/prefix/runtime" "wineprefix not found"; die "Prefix dir not found or missing pfx: $PREFIX_DIR"; }
 set_var COMPATDATA_DIR "$PREFIX_DIR"
 set_var WINEPREFIX "$PREFIX_DIR/pfx"
+
+resolve_component_wineprefix() {
+  local compat_dir="$1"
+  local fallback_dir="$2"
+  local normalized=""
+
+  if [[ -n "$compat_dir" ]]; then
+    normalized="$(normalize_prefix_dir "$compat_dir")"
+  else
+    normalized="$fallback_dir"
+  fi
+
+  if [[ -z "$normalized" || ! -d "$normalized/pfx" ]]; then
+    warn "Component prefix dir invalid or missing pfx ($compat_dir); falling back to $fallback_dir"
+    normalized="$fallback_dir"
+  fi
+
+  printf '%s/pfx' "$normalized"
+}
+
+set_var GAME_WINEPREFIX "$(resolve_component_wineprefix "$GAME_PREFIX_DIR" "$PREFIX_DIR")"
+set_var EDCOPILOT_WINEPREFIX "$(resolve_component_wineprefix "$EDCOPILOT_PREFIX_DIR" "$PREFIX_DIR")"
+set_var EDCOPTER_WINEPREFIX "$(resolve_component_wineprefix "$EDCOPTER_PREFIX_DIR" "$PREFIX_DIR")"
+set_var TOOL_WINEPREFIX "$(resolve_component_wineprefix "$TOOL_PREFIX_DIR" "$PREFIX_DIR")"
+set_var WINEPREFIX "$GAME_WINEPREFIX"
 set_var RUNTIME_CLIENT "$(cfg_get 'steam.runtime_client' '')"
 [[ -z "$RUNTIME_CLIENT" ]] && set_var RUNTIME_CLIENT "$(detect_runtime_client "$STEAM_ROOT" || true)"
 set_var RUNTIME_CLIENT_READY "false"
@@ -2526,14 +2564,14 @@ set_var PROTON_BIN "$(cfg_get 'proton.proton' '')"
 [[ -n "$PROTON_BIN" && -x "$PROTON_BIN" ]] || { phase_fail "detect steam/prefix/runtime" "proton not found"; die "proton not found"; }
 set_var WINELOADER "$(dirname "$PROTON_BIN")/files/bin/wine"
 set_var EDCOPILOT_EXE "$(cfg_get 'edcopilot.exe' '')"
-[[ -z "$EDCOPILOT_EXE" ]] && set_var EDCOPILOT_EXE "$WINEPREFIX/$EDCOPILOT_EXE_REL"
+[[ -z "$EDCOPILOT_EXE" ]] && set_var EDCOPILOT_EXE "$EDCOPILOT_WINEPREFIX/$EDCOPILOT_EXE_REL"
 CFG_SOURCE['edcopilot.exe']="config:edcopilot.exe"
 if ! cfg_has 'edcopilot.exe'; then
   CFG_SOURCE['edcopilot.exe']="default:edcopilot.exe_rel"
 fi
 prepare_edcopilot_config "$EDCOPILOT_FORCE_LINUX_FLAG"
 set_var EDCOPTER_EXE ""
-[[ -n "$EDCOPTER_EXE_REL" ]] && set_var EDCOPTER_EXE "$WINEPREFIX/$EDCOPTER_EXE_REL"
+[[ -n "$EDCOPTER_EXE_REL" ]] && set_var EDCOPTER_EXE "$EDCOPTER_WINEPREFIX/$EDCOPTER_EXE_REL"
 if [[ "$PULSE_LATENCY_MSEC" =~ ^[0-9]+$ ]]; then
   export PULSE_LATENCY_MSEC
 else
@@ -2686,13 +2724,13 @@ while true; do
           resolved_bus="$(discover_runtime_bus_name "$DEFAULT_BUS_NAME" || true)"
           if [[ -n "$resolved_bus" ]]; then
             set_var BUS_NAME "$resolved_bus"
-            launch_wine_child "edcopter" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- "$WINELOADER" "$EDCOPTER_EXE"
+            launch_wine_child "edcopter" with_wineprefix_env "$EDCOPTER_WINEPREFIX" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- "$WINELOADER" "$EDCOPTER_EXE"
           else
             warn "Steam runtime bus could not be detected for EDCoPTER; falling back to Proton"
-            launch_wine_child "edcopter" "$PROTON_BIN" run "$EDCOPTER_EXE"
+            launch_wine_child "edcopter" with_wineprefix_env "$EDCOPTER_WINEPREFIX" "$PROTON_BIN" run "$EDCOPTER_EXE"
           fi
         else
-          launch_wine_child "edcopter" "$PROTON_BIN" run "$EDCOPTER_EXE"
+          launch_wine_child "edcopter" with_wineprefix_env "$EDCOPTER_WINEPREFIX" "$PROTON_BIN" run "$EDCOPTER_EXE"
         fi
       fi
       for t in "${CLI_TOOLS[@]}"; do
