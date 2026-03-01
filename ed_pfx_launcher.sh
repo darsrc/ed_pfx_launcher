@@ -2027,25 +2027,83 @@ build_edcopilot_winedlloverrides() {
   fi
 }
 
-build_edcopilot_env_args() {
-  local merged_overrides=""
+build_component_env_args() {
+  local component="${1,,}"
+  local component_prefix=""
+  local component_compatdata=""
   local default_winedebug='-all,+seh,+err,+mscoree,+loaddll'
 
-  EDCOPILOT_ENV_ARGS=(
-    "WINEPREFIX=$EDCOPILOT_WINEPREFIX"
+  case "$component" in
+    game)
+      component_prefix="${GAME_WINEPREFIX:-}"
+      ;;
+    edcopilot)
+      component_prefix="${EDCOPILOT_WINEPREFIX:-}"
+      ;;
+    edcopter)
+      component_prefix="${EDCOPTER_WINEPREFIX:-}"
+      ;;
+    tool|tools)
+      component_prefix="${TOOL_WINEPREFIX:-}"
+      ;;
+    *)
+      warn "Unknown component '$1' for env assembly; defaulting to game"
+      component="game"
+      component_prefix="${GAME_WINEPREFIX:-}"
+      ;;
+  esac
+
+  if [[ -z "$component_prefix" ]]; then
+    component_prefix="${WINEPREFIX:-}"
+  fi
+
+  if [[ -n "$component_prefix" ]]; then
+    component_compatdata="$(dirname "$component_prefix")"
+  else
+    component_compatdata="${COMPATDATA_DIR:-${PREFIX_DIR:-}}"
+  fi
+
+  COMPONENT_ENV_ARGS=(
+    "WINEPREFIX=$component_prefix"
+    "STEAM_COMPAT_DATA_PATH=$component_compatdata"
+    "STEAM_COMPAT_CLIENT_INSTALL_PATH=${STEAM_ROOT:-}"
     "WINEFSYNC=1"
     "WINEESYNC=1"
-    "SDL_JOYSTICK_DISABLE=1"
-    "SDL_GAMECONTROLLER_DISABLE=1"
-    "PYGAME_FORCE_JOYSTICK=0"
   )
 
-  merged_overrides="$(build_edcopilot_winedlloverrides)"
-  EDCOPILOT_ENV_ARGS+=("WINEDLLOVERRIDES=$merged_overrides")
-
-  if [[ -z "${WINEDEBUG+x}" ]]; then
-    EDCOPILOT_ENV_ARGS+=("WINEDEBUG=$default_winedebug")
+  if [[ "${FRONTIER_ACTIVE:-0}" -eq 1 || "${ELITE_PLATFORM:-}" == "frontier" ]]; then
+    COMPONENT_ENV_ARGS+=("WINEDEBUG=-all")
+  else
+    COMPONENT_ENV_ARGS+=("SteamGameId=${APPID:-}" "WINEDEBUG=-all")
   fi
+
+  if [[ "$component" == "edcopilot" ]]; then
+    local merged_overrides=""
+    merged_overrides="$(build_edcopilot_winedlloverrides)"
+    COMPONENT_ENV_ARGS+=(
+      "SDL_JOYSTICK_DISABLE=1"
+      "SDL_GAMECONTROLLER_DISABLE=1"
+      "PYGAME_FORCE_JOYSTICK=0"
+      "WINEDLLOVERRIDES=$merged_overrides"
+    )
+    if [[ -z "${WINEDEBUG+x}" ]]; then
+      COMPONENT_ENV_ARGS+=("WINEDEBUG=$default_winedebug")
+    fi
+  fi
+}
+
+log_component_launch_context() {
+  local label="$1"
+  local component="$2"
+  local prefix=""
+  build_component_env_args "$component"
+  prefix="${COMPONENT_ENV_ARGS[0]#WINEPREFIX=}"
+  log "Launch component='$label' env_component='$component' resolved_prefix='$prefix'"
+}
+
+build_edcopilot_env_args() {
+  build_component_env_args "edcopilot"
+  EDCOPILOT_ENV_ARGS=("${COMPONENT_ENV_ARGS[@]}")
 }
 
 launch_edcopilot_runtime() {
@@ -2055,6 +2113,7 @@ launch_edcopilot_runtime() {
   local elapsed=0
   build_edcopilot_env_args
   local -a edcopilot_cmd=(env "${EDCOPILOT_ENV_ARGS[@]}" "$WINELOADER" "$EDCOPILOT_EXE")
+  log_component_launch_context "edcopilot" "edcopilot"
 
   [[ "$DRY_RUN" -eq 1 ]] && {
     log "DRY-RUN child[edcopilot]: $runtime_client --bus-name=\"com.steampowered.App${APPID}\" --pass-env-matching=\"WINE*\" --pass-env-matching=\"STEAM*\" --pass-env-matching=\"PROTON*\" --env=\"SteamGameId=${APPID}\" -- \"$WINELOADER\" \"$EDCOPILOT_EXE\""
@@ -2142,6 +2201,7 @@ launch_edcopilot() {
   if [[ "$mode" == "wine" ]]; then
     log "Launching EDCoPilot via Proton wine loader"
     build_edcopilot_env_args
+    log_component_launch_context "edcopilot" "edcopilot"
     launch_wine_child "edcopilot" env "${EDCOPILOT_ENV_ARGS[@]}" "$WINELOADER" "$EDCOPILOT_EXE"
     return 0
   fi
@@ -2185,6 +2245,7 @@ launch_edcopilot() {
     if [[ "$mode" == "auto" ]]; then
       warn "Steam runtime bus not present; auto mode falling back to Proton wine loader"
       build_edcopilot_env_args
+      log_component_launch_context "edcopilot" "edcopilot"
       launch_wine_child "edcopilot" env "${EDCOPILOT_ENV_ARGS[@]}" "$WINELOADER" "$EDCOPILOT_EXE"
       return 0
     fi
@@ -2200,6 +2261,7 @@ launch_edcopilot() {
   if [[ "$mode" == "auto" ]]; then
     warn "Steam runtime client unavailable; auto mode falling back to Proton wine loader"
     build_edcopilot_env_args
+    log_component_launch_context "edcopilot" "edcopilot"
     launch_wine_child "edcopilot" env "${EDCOPILOT_ENV_ARGS[@]}" "$WINELOADER" "$EDCOPILOT_EXE"
     return 0
   fi
@@ -2210,6 +2272,10 @@ launch_edcopilot() {
 
 build_windows_launch_cmd() {
   local exe_path="$1"
+  local -a game_env=()
+
+  build_component_env_args "game"
+  game_env=("${COMPONENT_ENV_ARGS[@]}")
 
   if [[ "${RUNTIME_CLIENT_READY:-false}" == "true" && -x "${RUNTIME_CLIENT:-}" ]]; then
     GAME_CMD_ARR=(
@@ -2219,10 +2285,10 @@ build_windows_launch_cmd() {
       --pass-env-matching="STEAM*"
       --pass-env-matching="PROTON*"
       --env="SteamGameId=$APPID"
-      -- "$WINELOADER" "$exe_path"
+      -- env "${game_env[@]}" "$WINELOADER" "$exe_path"
     )
   else
-    GAME_CMD_ARR=("$PROTON_BIN" run "$exe_path")
+    GAME_CMD_ARR=(env "${game_env[@]}" "$PROTON_BIN" run "$exe_path")
   fi
 }
 
@@ -2231,6 +2297,10 @@ build_mined_launch_cmd() {
   local mined_native=""
   local mined_dir=""
   local pass_command_effective="$PASS_COMMAND"
+  local -a game_env=()
+
+  build_component_env_args "game"
+  game_env=("${COMPONENT_ENV_ARGS[@]}")
 
   if [[ "$mined_exe" == */MinEdLauncher.exe ]]; then
     mined_dir="$(dirname "$mined_exe")"
@@ -2261,14 +2331,14 @@ build_mined_launch_cmd() {
       --pass-env-matching="STEAM*"
       --pass-env-matching="PROTON*"
       --env="SteamGameId=$APPID"
-      -- "$WINELOADER" "$mined_exe"
+      -- env "${game_env[@]}" "$WINELOADER" "$mined_exe"
     )
     if [[ "$STEAM_MODE" -eq 1 && "$pass_command_effective" == "true" && ${#FORWARDED_CMD[@]} -gt 0 ]]; then
       GAME_CMD_ARR+=("${FORWARDED_CMD[@]}")
     fi
     GAME_CMD_ARR+=("${MINED_ARGS_ARR[@]}")
   else
-    GAME_CMD_ARR=("$PROTON_BIN" run "$mined_exe")
+    GAME_CMD_ARR=(env "${game_env[@]}" "$PROTON_BIN" run "$mined_exe")
     if [[ "$STEAM_MODE" -eq 1 && "$pass_command_effective" == "true" && ${#FORWARDED_CMD[@]} -gt 0 ]]; then
       GAME_CMD_ARR+=("${FORWARDED_CMD[@]}")
     fi
@@ -2281,6 +2351,7 @@ launch_game_process() {
   local launch_dir="${GAME_WORKDIR:-}"
 
   debug_cmd "game command" "${GAME_CMD_ARR[@]}"
+  log_component_launch_context "game" "game"
 
   if [[ -n "$launch_dir" ]]; then
     (
@@ -2332,10 +2403,13 @@ launch_tool() {
     if is_edcopilot_tool_binary "$tool_path"; then
       log "Launching tool '$label' via Proton wine loader (EDCoPilot binary)"
       build_edcopilot_env_args
+      log_component_launch_context "$label" "edcopilot"
       launch_wine_child "$label" env "${EDCOPILOT_ENV_ARGS[@]}" "$WINELOADER" "$tool_path"
     else
       log "Launching tool '$label' via Proton (no-game tool mode)"
-      launch_wine_child "$label" with_wineprefix_env "$TOOL_WINEPREFIX" "$PROTON_BIN" run "$tool_path"
+      build_component_env_args "tool"
+      log_component_launch_context "$label" "tool"
+      launch_wine_child "$label" env "${COMPONENT_ENV_ARGS[@]}" "$PROTON_BIN" run "$tool_path"
     fi
     return 0
   fi
@@ -2348,9 +2422,12 @@ launch_tool() {
       log "Launching tool '$label' via Steam runtime bus '$BUS_NAME'"
       if is_edcopilot_tool_binary "$tool_path"; then
         build_edcopilot_env_args
+        log_component_launch_context "$label" "edcopilot"
         launch_wine_child "$label" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- env "${EDCOPILOT_ENV_ARGS[@]}" "$WINELOADER" "$tool_path"
       else
-        launch_wine_child "$label" with_wineprefix_env "$TOOL_WINEPREFIX" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- "$WINELOADER" "$tool_path"
+        build_component_env_args "tool"
+        log_component_launch_context "$label" "tool"
+        launch_wine_child "$label" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- env "${COMPONENT_ENV_ARGS[@]}" "$WINELOADER" "$tool_path"
       fi
       return 0
     fi
@@ -2360,9 +2437,12 @@ launch_tool() {
   if is_edcopilot_tool_binary "$tool_path"; then
     log "Launching tool '$label' via Proton wine loader (EDCoPilot binary fallback)"
     build_edcopilot_env_args
+    log_component_launch_context "$label" "edcopilot"
     launch_wine_child "$label" env "${EDCOPILOT_ENV_ARGS[@]}" "$WINELOADER" "$tool_path"
   else
-    launch_wine_child "$label" with_wineprefix_env "$TOOL_WINEPREFIX" "$PROTON_BIN" run "$tool_path"
+    build_component_env_args "tool"
+    log_component_launch_context "$label" "tool"
+    launch_wine_child "$label" env "${COMPONENT_ENV_ARGS[@]}" "$PROTON_BIN" run "$tool_path"
   fi
 }
 
@@ -2748,7 +2828,7 @@ else
   warn "Invalid audio.pulse_latency_msec='$PULSE_LATENCY_MSEC'; using 90"
   export PULSE_LATENCY_MSEC="90"
 fi
-if [[ "${FRONTIER_ACTIVE:-0}" -eq 1 || "$ELITE_PLATFORM" == "frontier" ]]; then
+if [[ "${FRONTIER_ACTIVE:-0}" -eq 1 || "${ELITE_PLATFORM:-}" == "frontier" ]]; then
   unset SteamGameId SteamAppId
   export WINEPREFIX STEAM_COMPAT_DATA_PATH="$COMPATDATA_DIR" STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT" WINEDEBUG="-all"
 else
@@ -2808,8 +2888,9 @@ while true; do
                 build_mined_launch_cmd "$GAME_EXE_PATH"
                 debug "updated GAME_CMD_ARR fallback to Proton run $GAME_EXE_PATH with MinEdLauncher args"
               else
-                GAME_CMD_ARR=("$PROTON_BIN" run "$GAME_EXE_PATH")
-                debug "updated GAME_CMD_ARR fallback to Proton run $GAME_EXE_PATH"
+                build_component_env_args "game"
+                GAME_CMD_ARR=(env "${COMPONENT_ENV_ARGS[@]}" "$PROTON_BIN" run "$GAME_EXE_PATH")
+                debug "updated GAME_CMD_ARR fallback to Proton run $GAME_EXE_PATH with explicit component env"
               fi
               launch_game_process
               set_var GAME_PID "$!"
@@ -2894,13 +2975,19 @@ while true; do
           resolved_bus="$(discover_runtime_bus_name "$DEFAULT_BUS_NAME" || true)"
           if [[ -n "$resolved_bus" ]]; then
             set_var BUS_NAME "$resolved_bus"
-            launch_wine_child "edcopter" with_wineprefix_env "$EDCOPTER_WINEPREFIX" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- "$WINELOADER" "$EDCOPTER_EXE"
+            build_component_env_args "edcopter"
+            log_component_launch_context "edcopter" "edcopter"
+            launch_wine_child "edcopter" "$RUNTIME_CLIENT" --bus-name="$BUS_NAME" --pass-env-matching="WINE*" --pass-env-matching="STEAM*" --pass-env-matching="PROTON*" --env="SteamGameId=$APPID" -- env "${COMPONENT_ENV_ARGS[@]}" "$WINELOADER" "$EDCOPTER_EXE"
           else
             warn "Steam runtime bus could not be detected for EDCoPTER; falling back to Proton"
-            launch_wine_child "edcopter" with_wineprefix_env "$EDCOPTER_WINEPREFIX" "$PROTON_BIN" run "$EDCOPTER_EXE"
+            build_component_env_args "edcopter"
+            log_component_launch_context "edcopter" "edcopter"
+            launch_wine_child "edcopter" env "${COMPONENT_ENV_ARGS[@]}" "$PROTON_BIN" run "$EDCOPTER_EXE"
           fi
         else
-          launch_wine_child "edcopter" with_wineprefix_env "$EDCOPTER_WINEPREFIX" "$PROTON_BIN" run "$EDCOPTER_EXE"
+          build_component_env_args "edcopter"
+          log_component_launch_context "edcopter" "edcopter"
+          launch_wine_child "edcopter" env "${COMPONENT_ENV_ARGS[@]}" "$PROTON_BIN" run "$EDCOPTER_EXE"
         fi
       fi
       for t in "${CLI_TOOLS[@]}"; do
