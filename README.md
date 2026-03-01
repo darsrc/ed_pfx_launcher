@@ -37,7 +37,11 @@ You can override or tune detection for the Wine prefix and Proton install:
 
 When `steam.compatdata_dir` is still present, it is treated as a compatibility alias for `steam.prefix_dir`.
 
-When `--interactive` is used, the script scans for all detectable prefix and Proton locations, routes to the selected interactive UI path, and writes `[steam] prefix_dir` and `[proton] dir` into the active config file before continuing. `wizard` is preferred by default for TTY sessions; it automatically falls back to `legacy` for non-TTY sessions or insufficient terminal capabilities. Logs include which UI path was selected and why. The legacy path is deprecated and retained for one release window during rollout.
+When `--interactive` is used, the script scans for all detectable prefix and Proton locations, routes to the selected interactive UI path, and writes `[steam] prefix_dir` and `[proton] dir` into the active config file before continuing.
+
+`wizard` now uses a dedicated backend (`scripts/interactive_ui.py`) built on `prompt_toolkit`, with step-by-step candidate selection, review, and explicit save/cancel confirmations. If stdin/stdout are not TTYs (or the wizard backend is unavailable), the backend emits a legacy-compatible auto-select fallback so behavior remains stable in non-interactive sessions. Logs include which UI path was selected and whether wizard used fallback behavior.
+
+`legacy` keeps the previous shell-driven prompt flow for a transition window and remains available through `--interactive-ui legacy`.
 
 ## Shared data bridge across prefixes
 
@@ -68,4 +72,4 @@ Run `scripts/smoke_interactive.sh` for a deterministic local smoke pass/fail sum
 - unset-variable safety in bootstrap token expansion,
 - interactive wizard cancel path does not modify config,
 - interactive save path writes both `[steam] prefix_dir` and `[proton] dir`,
-- non-TTY wizard fallback to legacy interactive path.
+- non-TTY wizard backend fallback logs and legacy-compatible auto-select behavior.

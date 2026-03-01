@@ -133,12 +133,12 @@ assert_cmd_ok \
   env -u COMPATDATA_DIR STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT" "$LAUNCHER" --config "$CFG_UNSET" --no-game --dry-run --debug
 assert_file_not_contains "$OUT_UNSET" "unbound variable" "no unbound variable crash during bootstrap expansion"
 
-# 2) Cancel path does not write config (wizard in TTY, press q).
+# 2) Cancel path does not write config (wizard backend test hook).
 CFG_CANCEL="$TMP_DIR/cancel.ini"
 write_base_config "$CFG_CANCEL" "$STEAM_ROOT" "$APPID"
 cp "$CFG_CANCEL" "$CFG_CANCEL.before"
 OUT_CANCEL="$TMP_DIR/out_cancel.log"
-if printf 'q' | script -qfec "$LAUNCHER --config '$CFG_CANCEL' --interactive --interactive-ui wizard --no-game --dry-run --debug" /dev/null >"$OUT_CANCEL" 2>&1; then
+if ED_PFX_UI_TEST_ACTION=cancel "$LAUNCHER" --config "$CFG_CANCEL" --interactive --interactive-ui wizard --no-game --dry-run --debug >"$OUT_CANCEL" 2>&1; then
   fail "wizard cancel exits non-zero to signal cancellation"
   sed -n '1,120p' "$OUT_CANCEL"
 else
@@ -155,9 +155,8 @@ assert_cmd_ok \
   "non-TTY interactive run succeeds" \
   "$OUT_SAVE" \
   "$LAUNCHER" --config "$CFG_SAVE" --interactive --interactive-ui wizard --no-game --dry-run --debug
-assert_file_contains "$OUT_SAVE" "Interactive UI route selected: ui=legacy requested=wizard" "wizard falls back to legacy on non-TTY"
-assert_file_contains "$OUT_SAVE" "reason=non-TTY session detected" "non-TTY fallback reason logged"
-assert_file_contains "$OUT_SAVE" "Legacy interactive UI auto-selected values in non-TTY mode" "legacy non-TTY auto-select path used"
+assert_file_contains "$OUT_SAVE" "Interactive UI route selected: ui=wizard requested=wizard" "wizard route selected"
+assert_file_contains "$OUT_SAVE" "Interactive wizard backend used non-TTY fallback behavior" "non-TTY fallback behavior logged"
 assert_file_contains "$CFG_SAVE" "prefix_dir=$STEAM_ROOT/steamapps/compatdata/$APPID" "save writes steam.prefix_dir"
 assert_file_contains "$CFG_SAVE" "dir=$STEAM_ROOT/steamapps/common/ProtonTest" "save writes proton.dir"
 

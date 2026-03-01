@@ -1246,21 +1246,16 @@ interactive_configure_paths() {
 
   case "$requested_ui" in
     wizard)
-      if ! wizard_terminal_capabilities_ok reason; then
-        selected_ui="legacy"
-      fi
+      reason="Wizard UI selected"
       ;;
     legacy)
       reason="Legacy UI explicitly selected"
       ;;
     *)
-      warn "Invalid interactive UI '$requested_ui'; defaulting to wizard with capability fallback"
+      warn "Invalid interactive UI '$requested_ui'; defaulting to wizard"
       requested_ui="wizard"
       selected_ui="wizard"
       reason="Invalid request defaulted to wizard"
-      if ! wizard_terminal_capabilities_ok reason; then
-        selected_ui="legacy"
-      fi
       ;;
   esac
 
@@ -1356,9 +1351,10 @@ interactive_wizard_run() {
   local appid="$2"
   local preferred_prefix_root="$3"
   local preferred_proton_root="$4"
-  local selected_prefix selected_proton key
+  local selected_prefix selected_proton status message
+  local ui_script="$SCRIPT_DIR/scripts/interactive_ui.py"
   local -a prefix_candidates=() proton_candidates=()
-  local -A wizard_state=()
+  local -a ui_cmd=() ui_lines=()
 
   mapfile -t prefix_candidates < <(detect_prefix_candidates "$steam_root" "$appid" "$preferred_prefix_root")
   mapfile -t proton_candidates < <(detect_proton_candidates "$steam_root" "$preferred_proton_root")
@@ -1369,98 +1365,64 @@ interactive_wizard_run() {
   if (( ${#proton_candidates[@]} == 0 )); then
     die "Interactive mode could not find any Proton candidates"
   fi
+  [[ -f "$ui_script" ]] || die "Interactive wizard backend not found: $ui_script"
 
-  wizard_state[steam_root]="$steam_root"
-  wizard_state[appid]="$appid"
-  wizard_state[config_path]="$CONFIG_PATH"
-  wizard_state[active_step]=0
-  wizard_state[focus]=main
-  wizard_state[prefix_idx]=0
-  wizard_state[proton_idx]=0
-  wizard_state[status]="Detecting candidates"
-  wizard_state[prefix_candidates]="$(printf '%s\n' "${prefix_candidates[@]}")"
-  wizard_state[proton_candidates]="$(printf '%s\n' "${proton_candidates[@]}")"
-  wizard_state[is_valid]=0
+  ui_cmd=(python3 "$ui_script" --prefix-select "$PREFIX_SELECT" --proton-select "$PROTON_SELECT")
+  local candidate
+  for candidate in "${prefix_candidates[@]}"; do
+    ui_cmd+=(--prefix-candidate "$candidate")
+  done
+  for candidate in "${proton_candidates[@]}"; do
+    ui_cmd+=(--proton-candidate "$candidate")
+  done
 
-  [[ -t 0 && -t 1 ]] || die "Interactive mode requires a TTY"
-  tput civis 2>/dev/null || true
-  trap 'tput cnorm 2>/dev/null || true' RETURN
+  if ! mapfile -t ui_lines < <("${ui_cmd[@]}"); then
+    warn "Interactive wizard backend failed; falling back to legacy path"
+    interactive_legacy_run "$steam_root" "$appid" "$preferred_prefix_root" "$preferred_proton_root"
+    return
+  fi
 
-  while true; do
-    selected_prefix="${prefix_candidates[${wizard_state[prefix_idx]}]}"
-    selected_proton="${proton_candidates[${wizard_state[proton_idx]}]}"
-    wizard_state[selected_prefix]="$selected_prefix"
-    wizard_state[selected_proton]="$selected_proton"
-    wizard_state[selected_proton_dir]="$(dirname "$selected_proton")"
-    if [[ -d "$selected_prefix/pfx" && -x "$selected_proton" ]]; then
-      wizard_state[is_valid]=1
-    else
-      wizard_state[is_valid]=0
-    fi
-    render_interactive_menu wizard_state
-    IFS= read -rsn1 key || return 1
+  local line key value
+  status=""
+  selected_prefix=""
+  selected_proton=""
+  message=""
+  for line in "${ui_lines[@]}"; do
+    key="${line%%=*}"
+    value="${line#*=}"
     case "$key" in
-      q|Q)
-        printf '\n'
-        log "Interactive wizard cancelled; config unchanged"
-        return 1
-        ;;
-      s|S)
-        if [[ "${wizard_state[is_valid]}" == "1" ]]; then
-          wizard_state[active_step]=4
-          break
-        else
-          wizard_state[status]="Cannot save: select valid prefix and Proton"
-        fi
-        ;;
-      "")
-        case "${wizard_state[active_step]}" in
-          0) wizard_state[active_step]=1; wizard_state[status]="Select a prefix" ;;
-          1) wizard_state[active_step]=2; wizard_state[status]="Prefix selected" ;;
-          2) wizard_state[active_step]=3; wizard_state[status]="Proton selected" ;;
-          3) wizard_state[active_step]=4; wizard_state[status]="Review complete" ;;
-          4) [[ "${wizard_state[is_valid]}" == "1" ]] && break ;;
-        esac
-        ;;
-      $'\t')
-        wizard_state[active_step]=$(( (wizard_state[active_step] + 1) % 5 ))
-        ;;
-      j)
-        case "${wizard_state[active_step]}" in
-          1) wizard_state[prefix_idx]=$(( (wizard_state[prefix_idx] + 1) % ${#prefix_candidates[@]} )) ;;
-          2) wizard_state[proton_idx]=$(( (wizard_state[proton_idx] + 1) % ${#proton_candidates[@]} )) ;;
-        esac
-        ;;
-      k)
-        case "${wizard_state[active_step]}" in
-          1) wizard_state[prefix_idx]=$(( (wizard_state[prefix_idx] - 1 + ${#prefix_candidates[@]}) % ${#prefix_candidates[@]} )) ;;
-          2) wizard_state[proton_idx]=$(( (wizard_state[proton_idx] - 1 + ${#proton_candidates[@]}) % ${#proton_candidates[@]} )) ;;
-        esac
-        ;;
-      $'\x1b')
-        IFS= read -rsn1 -t 0.05 key || continue
-        [[ "$key" == "[" ]] || continue
-        IFS= read -rsn1 -t 0.05 key || continue
-        case "$key" in
-          A)
-            case "${wizard_state[active_step]}" in
-              1) wizard_state[prefix_idx]=$(( (wizard_state[prefix_idx] - 1 + ${#prefix_candidates[@]}) % ${#prefix_candidates[@]} )) ;;
-              2) wizard_state[proton_idx]=$(( (wizard_state[proton_idx] - 1 + ${#proton_candidates[@]}) % ${#proton_candidates[@]} )) ;;
-            esac
-            ;;
-          B)
-            case "${wizard_state[active_step]}" in
-              1) wizard_state[prefix_idx]=$(( (wizard_state[prefix_idx] + 1) % ${#prefix_candidates[@]} )) ;;
-              2) wizard_state[proton_idx]=$(( (wizard_state[proton_idx] + 1) % ${#proton_candidates[@]} )) ;;
-            esac
-            ;;
-        esac
-        ;;
+      status) status="$value" ;;
+      prefix) selected_prefix="$value" ;;
+      proton) selected_proton="$value" ;;
+      message) message="$value" ;;
     esac
   done
 
-  selected_prefix="${wizard_state[selected_prefix]}"
-  selected_proton="${wizard_state[selected_proton]}"
+  case "$status" in
+    cancel)
+      log "Interactive wizard cancelled; config unchanged"
+      [[ -n "$message" ]] && log "Interactive wizard detail: $message"
+      return 1
+      ;;
+    fallback)
+      log "Interactive wizard backend used non-TTY fallback behavior"
+      [[ -n "$message" ]] && log "Interactive wizard detail: $message"
+      ;;
+    save)
+      [[ -n "$message" ]] && log "Interactive wizard detail: $message"
+      ;;
+    *)
+      warn "Interactive wizard returned unexpected status '$status'; falling back to legacy path"
+      interactive_legacy_run "$steam_root" "$appid" "$preferred_prefix_root" "$preferred_proton_root"
+      return
+      ;;
+  esac
+
+  if [[ -z "$selected_prefix" || -z "$selected_proton" ]]; then
+    warn "Interactive wizard did not return complete selections; falling back to legacy path"
+    interactive_legacy_run "$steam_root" "$appid" "$preferred_prefix_root" "$preferred_proton_root"
+    return
+  fi
 
   if ! commit_interactive_config_changes "$CONFIG_PATH" "$selected_prefix" "$(dirname "$selected_proton")"; then
     warn "Interactive wizard save failed; leaving configuration unchanged"
@@ -1477,7 +1439,6 @@ interactive_wizard_run() {
   log "Interactive selection applied: steam.prefix_dir=$selected_prefix"
   log "Interactive selection applied: proton.dir=$(dirname "$selected_proton")"
 }
-
 wait_for_process_any() {
   local timeout="$1"; shift
   local i=0 p
