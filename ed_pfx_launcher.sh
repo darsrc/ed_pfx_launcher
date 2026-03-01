@@ -244,6 +244,169 @@ cfg_select_int() {
   printf '%s' "$default"
 }
 
+normalize_shared_rel_path() {
+  local raw="$1"
+  local normalized="${raw//\\//}"
+  normalized="${normalized#/}"
+  normalized="${normalized#./}"
+  normalized="${normalized#drive_c/}"
+  printf '%s' "$normalized"
+}
+
+shared_data_host_path() {
+  local wineprefix="$1"
+  local rel_path="$2"
+  printf '%s/drive_c/%s' "$wineprefix" "$rel_path"
+}
+
+resolve_shared_data_source_wineprefix() {
+  local selector="${1,,}"
+  case "$selector" in
+    game) printf '%s' "$GAME_WINEPREFIX" ;;
+    edcopilot) printf '%s' "$EDCOPILOT_WINEPREFIX" ;;
+    edcopter) printf '%s' "$EDCOPTER_WINEPREFIX" ;;
+    tool|tools) printf '%s' "$TOOL_WINEPREFIX" ;;
+    *)
+      warn "Invalid shared_data.source_prefix='$1'; defaulting to game"
+      printf '%s' "$GAME_WINEPREFIX"
+      ;;
+  esac
+}
+
+collect_shared_data_mappings() {
+  local key="" rel_path=""
+  local -a mapping_keys=()
+
+  for key in "${!CFG[@]}"; do
+    [[ "$key" == shared_data.map_* ]] || continue
+    mapping_keys+=("$key")
+  done
+
+  if (( ${#mapping_keys[@]} == 0 )); then
+    mapping_keys=(
+      "shared_data.map_appdata_frontier"
+      "shared_data.map_appdata_edcopilot"
+      "shared_data.map_documents_frontier"
+    )
+  fi
+
+  printf '%s\n' "${mapping_keys[@]}" | sort | while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    rel_path="$(normalize_shared_rel_path "$(cfg_get "$key")")"
+    [[ -n "$rel_path" ]] || continue
+    printf '%s\n' "$rel_path"
+  done
+}
+
+link_shared_data_path() {
+  local src_prefix="$1" dst_prefix="$2" rel_path="$3"
+  local src_path dst_path existing_target=""
+
+  src_path="$(shared_data_host_path "$src_prefix" "$rel_path")"
+  dst_path="$(shared_data_host_path "$dst_prefix" "$rel_path")"
+
+  mkdir -p "$src_path"
+  mkdir -p "$(dirname "$dst_path")"
+
+  if [[ -L "$dst_path" ]]; then
+    existing_target="$(readlink -f "$dst_path" 2>/dev/null || true)"
+    if [[ "$existing_target" == "$src_path" ]]; then
+      debug "shared_data: already linked $dst_path -> $src_path"
+      return 0
+    fi
+    warn "shared_data: replacing mismatched symlink $dst_path -> $existing_target (expected $src_path)"
+    rm -f "$dst_path"
+  elif [[ -d "$dst_path" ]]; then
+    if [[ -n "$(find "$dst_path" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)" ]]; then
+      warn "shared_data: destination directory not empty, leaving untouched: $dst_path"
+      return 1
+    fi
+    rmdir "$dst_path" || {
+      warn "shared_data: failed to remove empty directory before linking: $dst_path"
+      return 1
+    }
+  elif [[ -e "$dst_path" ]]; then
+    warn "shared_data: destination exists and is not a directory/symlink, leaving untouched: $dst_path"
+    return 1
+  fi
+
+  ln -s "$src_path" "$dst_path"
+  log "shared_data: linked $dst_path -> $src_path"
+  return 0
+}
+
+validate_shared_data_links() {
+  local src_prefix="$1"
+  shift
+  local rel_path dst_prefix src_path dst_path link_target
+
+  while IFS= read -r rel_path; do
+    [[ -n "$rel_path" ]] || continue
+    src_path="$(shared_data_host_path "$src_prefix" "$rel_path")"
+    for dst_prefix in "$@"; do
+      [[ "$dst_prefix" == "$src_prefix" ]] && continue
+      dst_path="$(shared_data_host_path "$dst_prefix" "$rel_path")"
+      if [[ ! -e "$dst_path" && ! -L "$dst_path" ]]; then
+        warn "shared_data: expected mapped path missing: $dst_path"
+        continue
+      fi
+      if [[ ! -L "$dst_path" ]]; then
+        warn "shared_data: expected symlink but found regular path: $dst_path"
+        continue
+      fi
+      link_target="$(readlink -f "$dst_path" 2>/dev/null || true)"
+      if [[ "$link_target" != "$src_path" ]]; then
+        warn "shared_data: symlink mismatch $dst_path -> $link_target (expected $src_path)"
+      fi
+    done
+  done < <(collect_shared_data_mappings)
+}
+
+setup_shared_data_bridge() {
+  local enabled="$SHARED_DATA_ENABLED"
+  local strategy="${SHARED_DATA_STRATEGY,,}"
+  local source_selector="$SHARED_DATA_SOURCE_PREFIX"
+  local source_wineprefix rel_path dst_prefix
+  local -a target_prefixes=()
+
+  [[ "$enabled" == "true" ]] || return 0
+
+  source_wineprefix="$(resolve_shared_data_source_wineprefix "$source_selector")"
+  if [[ -z "$source_wineprefix" || ! -d "$source_wineprefix" ]]; then
+    warn "shared_data: source prefix is unavailable ($source_selector -> $source_wineprefix); skipping"
+    return 0
+  fi
+
+  target_prefixes=("$GAME_WINEPREFIX" "$EDCOPILOT_WINEPREFIX" "$EDCOPTER_WINEPREFIX" "$TOOL_WINEPREFIX")
+
+  case "$strategy" in
+    symlink)
+      while IFS= read -r rel_path; do
+        [[ -n "$rel_path" ]] || continue
+        for dst_prefix in "${target_prefixes[@]}"; do
+          [[ -n "$dst_prefix" && -d "$dst_prefix" ]] || continue
+          [[ "$dst_prefix" == "$source_wineprefix" ]] && continue
+          link_shared_data_path "$source_wineprefix" "$dst_prefix" "$rel_path" || true
+        done
+      done < <(collect_shared_data_mappings)
+      ;;
+    bind|copy)
+      warn "shared_data.strategy='$strategy' is configured but not implemented; using symlink"
+      SHARED_DATA_STRATEGY="symlink"
+      setup_shared_data_bridge
+      return 0
+      ;;
+    *)
+      warn "Invalid shared_data.strategy='$strategy'; expected symlink|bind|copy. Using symlink"
+      SHARED_DATA_STRATEGY="symlink"
+      setup_shared_data_bridge
+      return 0
+      ;;
+  esac
+
+  validate_shared_data_links "$source_wineprefix" "${target_prefixes[@]}"
+}
+
 cfg_assign_select() {
   local out_var="$1" target="$2" default="$3"
   shift 3
@@ -309,6 +472,9 @@ log_effective_config() {
   log "  resolved.edcopilot_wineprefix=$EDCOPILOT_WINEPREFIX source=$(cfg_source_or_unknown 'instances.edcopilot_prefix_dir')"
   log "  resolved.edcopter_wineprefix=$EDCOPTER_WINEPREFIX source=$(cfg_source_or_unknown 'instances.edcopter_prefix_dir')"
   log "  resolved.tool_wineprefix=$TOOL_WINEPREFIX source=$(cfg_source_or_unknown 'instances.tool_prefix_dir')"
+  log "  shared_data.enabled=$SHARED_DATA_ENABLED source=$(cfg_source_or_unknown 'shared_data.enabled')"
+  log "  shared_data.source_prefix=$SHARED_DATA_SOURCE_PREFIX source=$(cfg_source_or_unknown 'shared_data.source_prefix')"
+  log "  shared_data.strategy=$SHARED_DATA_STRATEGY source=$(cfg_source_or_unknown 'shared_data.strategy')"
   log "  elite.launcher_preference=$LAUNCHER_PREFERENCE source=$(cfg_source_or_unknown 'elite.launcher_preference')"
   log "  elite.pass_command=$PASS_COMMAND source=$(cfg_source_or_unknown 'elite.pass_command')"
   log "  proton.dir=$(dirname "$PROTON_BIN") source=$(cfg_source_or_unknown 'proton.dir')"
@@ -2414,6 +2580,9 @@ cfg_assign_select GAME_PREFIX_DIR 'instances.game_prefix_dir' '' 'instances.game
 cfg_assign_select EDCOPILOT_PREFIX_DIR 'instances.edcopilot_prefix_dir' '' 'instances.edcopilot_prefix_dir' 'steam.prefix_dir'
 cfg_assign_select EDCOPTER_PREFIX_DIR 'instances.edcopter_prefix_dir' '' 'instances.edcopter_prefix_dir' 'steam.prefix_dir'
 cfg_assign_select TOOL_PREFIX_DIR 'instances.tool_prefix_dir' '' 'instances.tool_prefix_dir' 'steam.prefix_dir'
+cfg_assign_select_bool SHARED_DATA_ENABLED 'shared_data.enabled' 'true' 'shared_data.enabled'
+cfg_assign_select SHARED_DATA_SOURCE_PREFIX 'shared_data.source_prefix' 'game' 'shared_data.source_prefix'
+cfg_assign_select SHARED_DATA_STRATEGY 'shared_data.strategy' 'symlink' 'shared_data.strategy'
 cfg_assign_select PREFIX_SELECT 'steam.prefix_select' 'first' 'steam.prefix_select'
 PREFIX_SELECT="${PREFIX_SELECT,,}"
 case "$PREFIX_SELECT" in
@@ -2537,6 +2706,7 @@ set_var GAME_WINEPREFIX "$(resolve_component_wineprefix "$GAME_PREFIX_DIR" "$PRE
 set_var EDCOPILOT_WINEPREFIX "$(resolve_component_wineprefix "$EDCOPILOT_PREFIX_DIR" "$PREFIX_DIR")"
 set_var EDCOPTER_WINEPREFIX "$(resolve_component_wineprefix "$EDCOPTER_PREFIX_DIR" "$PREFIX_DIR")"
 set_var TOOL_WINEPREFIX "$(resolve_component_wineprefix "$TOOL_PREFIX_DIR" "$PREFIX_DIR")"
+setup_shared_data_bridge
 set_var WINEPREFIX "$GAME_WINEPREFIX"
 set_var RUNTIME_CLIENT "$(cfg_get 'steam.runtime_client' '')"
 [[ -z "$RUNTIME_CLIENT" ]] && set_var RUNTIME_CLIENT "$(detect_runtime_client "$STEAM_ROOT" || true)"
